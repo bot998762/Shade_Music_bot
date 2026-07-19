@@ -57,7 +57,7 @@ class DatabaseManager:
 
     async def disconnect(self) -> None:
         """Close the Motor connection pool gracefully."""
-        if self.client:
+        if self.client is not None:
             self.client.close()
             self.client = None
             self.db = None

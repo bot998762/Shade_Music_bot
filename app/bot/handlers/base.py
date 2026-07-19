@@ -36,7 +36,6 @@ def register(client: Client, db: DatabaseManager) -> None:
         """Welcome message — also registers the user in the database."""
         user = msg.from_user
         if user:
-            repo = db.db.users if db.db else None  # type: ignore[attr-defined]
             # Lazy import to avoid circular deps
             from app.database.repositories.users import UserRepository
             if db.db is not None:
