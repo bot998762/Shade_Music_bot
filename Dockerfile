@@ -7,9 +7,12 @@
 # ── Stage 1: dependency builder ───────────────────────────────────────────────
 FROM python:3.12-slim AS builder
 
-# Install build dependencies only in the builder stage
+# Install build dependencies only in the builder stage.
+# libc6-dev provides stdint.h and the rest of the C standard library headers
+# required by TgCrypto (and any other C-extension package).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc \
+        libc6-dev \
         libffi-dev \
         libssl-dev \
     && rm -rf /var/lib/apt/lists/*

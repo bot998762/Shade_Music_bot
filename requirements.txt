@@ -1,6 +1,6 @@
 # ─── Telegram ────────────────────────────────────────────────────────────────
 pyrogram==2.0.106          # MTProto client (bot + assistant)
-TgCrypto==1.2.5            # Fast crypto for pyrogram
+TgCrypto==1.2.5            # Fast crypto for pyrogram (C extension — needs libc6-dev in Dockerfile builder stage)
 
 # ─── Database ────────────────────────────────────────────────────────────────
 motor==3.4.0               # Async MongoDB driver
