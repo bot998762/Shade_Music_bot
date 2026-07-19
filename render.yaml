@@ -1,0 +1,58 @@
+# ══════════════════════════════════════════════════════════════════════════════
+#  ShadeMusicBot — render.yaml
+#  Infrastructure-as-code for Render.com deployment.
+#
+#  Docs: https://render.com/docs/blueprint-spec
+# ══════════════════════════════════════════════════════════════════════════════
+
+services:
+  - type: web
+    name: shademusicbot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+
+    # Render's free/starter plan — upgrade as traffic grows
+    plan: starter
+
+    # Render sets $PORT automatically; our app reads it via Settings
+    # No need to hard-code the port here.
+
+    healthCheckPath: /health
+
+    # Auto-deploy when commits are pushed to the main branch
+    autoDeploy: true
+
+    # ── Environment Variables ──────────────────────────────────────────────────
+    # Mark each as sync: false so Render stores them as secrets in the dashboard
+    # rather than committing values to this file.
+    envVars:
+      - key: API_ID
+        sync: false
+
+      - key: API_HASH
+        sync: false
+
+      - key: BOT_TOKEN
+        sync: false
+
+      - key: OWNER_ID
+        sync: false
+
+      - key: MONGO_URI
+        sync: false
+
+      - key: MONGO_DB_NAME
+        value: shademusicbot
+
+      - key: LOG_LEVEL
+        value: INFO
+
+      - key: MAX_QUEUE_SIZE
+        value: "50"
+
+      - key: DEFAULT_VOLUME
+        value: "100"
+
+      - key: SUDO_USERS
+        value: ""

@@ -1,0 +1,23 @@
+# ─── Telegram ────────────────────────────────────────────────────────────────
+pyrogram==2.0.106          # MTProto client (bot + assistant)
+TgCrypto==1.2.5            # Fast crypto for pyrogram
+
+# ─── Database ────────────────────────────────────────────────────────────────
+motor==3.4.0               # Async MongoDB driver
+pymongo==4.7.2             # Sync MongoDB driver (used by motor internals)
+
+# ─── Web / Health ─────────────────────────────────────────────────────────────
+fastapi==0.111.0           # Health endpoint framework
+uvicorn[standard]==0.30.1  # ASGI server
+
+# ─── Configuration ────────────────────────────────────────────────────────────
+pydantic-settings==2.3.1   # Settings management via env vars
+pydantic==2.7.4            # Data validation
+python-dotenv==1.0.1       # .env file loading
+
+# ─── Logging ─────────────────────────────────────────────────────────────────
+loguru==0.7.2              # Structured logging with rotation
+
+# ─── Utilities ───────────────────────────────────────────────────────────────
+aiohttp==3.9.5             # Async HTTP client (future: search APIs)
+python-dateutil==2.9.0     # Date helpers

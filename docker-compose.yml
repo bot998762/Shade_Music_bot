@@ -1,0 +1,37 @@
+# ══════════════════════════════════════════════════════════════════════════════
+#  ShadeMusicBot — docker-compose (local development only)
+#  Render uses its own build pipeline; this file is for local testing.
+# ══════════════════════════════════════════════════════════════════════════════
+
+version: "3.9"
+
+services:
+  bot:
+    build:
+      context: .
+      target: production
+    image: shademusicbot:local
+    container_name: shademusicbot
+    restart: unless-stopped
+
+    # Load environment variables from .env (copy from .env.example first)
+    env_file:
+      - .env
+
+    ports:
+      - "8080:8080"
+
+    volumes:
+      # Persist log files across restarts during local dev
+      - ./logs:/app/logs
+
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+    # Graceful shutdown: give Pyrogram time to disconnect
+    stop_grace_period: 30s
