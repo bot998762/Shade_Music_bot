@@ -7,9 +7,10 @@
 # ── Stage 1: dependency builder ───────────────────────────────────────────────
 FROM python:3.12-slim AS builder
 
-# Install build dependencies only in the builder stage.
-# libc6-dev provides stdint.h and the rest of the C standard library headers
-# required by TgCrypto (and any other C-extension package).
+# libc6-dev  — provides stdint.h required by TgCrypto's C extension
+# gcc        — C compiler for any extension that needs compilation
+# libffi-dev — required by some Python C extensions
+# libssl-dev — required by TgCrypto / cryptographic extensions
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc \
         libc6-dev \
@@ -19,8 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# Copy only the requirements file first to maximise layer cache hits.
-# Docker rebuilds from this layer only when requirements.txt changes.
+# Copy requirements first — Docker only rebuilds this layer when the file changes
 COPY requirements.txt .
 
 RUN pip install --upgrade pip --no-cache-dir \
@@ -30,37 +30,39 @@ RUN pip install --upgrade pip --no-cache-dir \
 # ── Stage 2: production image ─────────────────────────────────────────────────
 FROM python:3.12-slim AS production
 
-# Runtime system dependencies (TgCrypto needs libssl at runtime)
+# Runtime dependencies:
+#   ffmpeg     — audio decoding / transcoding used by pytgcalls / ntgcalls
+#   libssl3    — TgCrypto runtime crypto
+#   ca-certs   — HTTPS for MongoDB Atlas and Telegram API
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg \
         libssl3 \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Create a non-root user for security best practices
+# Non-root user for security
 RUN groupadd --gid 1001 botuser \
  && useradd --uid 1001 --gid botuser --shell /bin/bash --create-home botuser
 
 WORKDIR /app
 
-# Copy installed packages from builder
+# Copy installed Python packages from builder
 COPY --from=builder /install /usr/local
 
-# Copy application source
+# Copy application source with correct ownership
 COPY --chown=botuser:botuser . .
 
-# Create logs directory with correct ownership
+# Persistent log directory
 RUN mkdir -p /app/logs && chown botuser:botuser /app/logs
 
-# Drop root privileges
 USER botuser
 
-# Render injects PORT; expose the default fallback for local Docker runs
+# Render injects $PORT at runtime; 8080 is the local fallback
 EXPOSE 8080
 
-# Health check — Render also configures this externally via render.yaml,
-# but having it in the Dockerfile helps local docker-compose runs.
-HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')" \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD python -c \
+        "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')" \
     || exit 1
 
 CMD ["python", "-u", "main.py"]

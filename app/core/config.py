@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 import sys
 from functools import lru_cache
-from typing import List
+from typing import List, Optional
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -61,6 +61,22 @@ class Settings(BaseSettings):
     # ── Bot Behaviour ─────────────────────────────────────────────────────────
     max_queue_size: int = Field(default=50, description="Max queued songs per chat")
     default_volume: int = Field(default=100, description="Default playback volume (0-200)")
+
+    # ── Phase 1: Voice Chat ────────────────────────────────────────────────────
+    # Optional Pyrogram string session for a user assistant account.
+    # When set, the assistant joins voice chats (recommended for production).
+    # When absent, the bot itself joins (requires voice-chat admin permission).
+    assistant_session: Optional[str] = Field(
+        default=None,
+        description="Pyrogram string session for the VC assistant (optional)",
+    )
+
+    # Path to a Netscape-format cookies.txt file for yt-dlp.
+    # The bot works without it; cookies unlock age-restricted / region-locked videos.
+    cookies_path: str = Field(
+        default="cookies.txt",
+        description="Path to yt-dlp cookies.txt (optional; ignored if file absent)",
+    )
 
     # ── Derived helpers ───────────────────────────────────────────────────────
     @property

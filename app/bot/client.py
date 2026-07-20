@@ -66,7 +66,7 @@ class BotClient:
 
     async def stop(self) -> None:
         """Stop the Pyrogram client cleanly."""
-        if self._client and self._client.is_connected:
+        if self._client is not None and self._client.is_connected:
             await self._client.stop()
 
     async def get_me(self) -> User:
@@ -82,18 +82,28 @@ class BotClient:
             raise RuntimeError("BotClient has not been started.")
         return self._client
 
+    def register_music_handlers(self, engine: object) -> None:
+        """
+        Attach Phase 1 music handlers to the running client.
+
+        Called by the lifecycle layer AFTER MusicEngine is fully initialised
+        so the engine reference is never None when a command arrives.
+        """
+        from app.bot.handlers import music as music_handlers
+
+        music_handlers.register(self._client, engine)  # type: ignore[arg-type]
+        logger.debug("Music handler group registered")
+
     # ── Private helpers ───────────────────────────────────────────────────────
 
     def _register_handlers(self) -> None:
         """
-        Import and attach all handler modules.
+        Attach base (Phase 0) handlers.
 
-        Each handler module exposes a ``register(client, db)`` function.
-        Adding a new handler group never requires touching this file —
-        just create the module and add one line here.
+        Music handlers are registered separately via register_music_handlers()
+        once the engine is ready, so no handler ever receives a None engine.
         """
         from app.bot.handlers import base as base_handlers
 
         base_handlers.register(self._client, self._db)  # type: ignore[arg-type]
-
-        logger.debug("Handler groups registered ✓")
+        logger.debug("Base handler group registered")

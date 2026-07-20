@@ -1,6 +1,14 @@
 # ─── Telegram ────────────────────────────────────────────────────────────────
-pyrogram==2.0.106          # MTProto client (bot + assistant)
-TgCrypto==1.2.5            # Fast crypto for pyrogram (C extension — needs libc6-dev in Dockerfile builder stage)
+pyrogram==2.0.106          # MTProto client (bot + optional user assistant)
+TgCrypto==1.2.5            # Fast crypto for pyrogram (C ext — needs libc6-dev in builder)
+
+# ─── Voice Chat Streaming ─────────────────────────────────────────────────────
+# pytgcalls 0.10+ uses the ntgcalls backend which ships pre-built Linux x86_64
+# binaries — no C compilation needed in Docker. Python 3.12 compatible.
+pytgcalls>=0.10.6
+
+# ─── YouTube / Audio ──────────────────────────────────────────────────────────
+yt-dlp>=2024.1.0           # YouTube search and stream extraction
 
 # ─── Database ────────────────────────────────────────────────────────────────
 motor==3.4.0               # Async MongoDB driver
