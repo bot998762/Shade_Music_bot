@@ -3,20 +3,19 @@ app.streaming.voice_chat
 ~~~~~~~~~~~~~~~~~~~~~~~~
 Thin, testable wrapper around py-tgcalls PyTgCalls.
 
-py-tgcalls 2.x compatibility notes
-------------------------------------
-* PyPI package  : py-tgcalls  (install name)
-* Import name   : pytgcalls   (same as always)
-* Exceptions    : AlreadyJoinedError, NoActiveGroupCall  <- from pytgcalls.exceptions
-                  TelegramServerError                    <- from ntgcalls (separate pkg)
-* Being 'not in call' raises a generic Exception in 2.x; broad catches used.
-* Stream end callback: @tgcalls.on_stream_end() still works; update.chat_id is valid.
-* on_kicked() and on_closed_voice_chat() decorators are available in 2.x.
+Exception-handling strategy
+----------------------------
+py-tgcalls has broken exception API compatibility across minor versions —
+names like AlreadyJoinedError and NoActiveGroupCall have been added,
+renamed, or removed between 2.0.x and 2.3.x.
 
-Upgrade path
-------------
-If py-tgcalls releases a new major API version, only this file changes.
-Engine and handlers remain untouched.
+To avoid ImportError on startup and to stay compatible with every current
+and future release, this module imports NO named exception from
+pytgcalls.exceptions.  All pytgcalls call-sites catch the bare Exception
+base class and inspect the message string where the error type matters.
+
+The only external exception we import is ntgcalls.NTgCallsError, which
+comes from the separate ntgcalls package and has been stable.
 """
 
 from __future__ import annotations
@@ -24,15 +23,28 @@ from __future__ import annotations
 import asyncio
 from typing import Awaitable, Callable, Optional, Set
 
-from ntgcalls import TelegramServerError
 from pyrogram import Client
 from pytgcalls import PyTgCalls
-from pytgcalls.exceptions import AlreadyJoinedError, NoActiveGroupCall
 from pytgcalls.types import MediaStream, Update
 
 from app.core.logger import logger
 
 StreamEndCallback = Callable[[int], Awaitable[None]]
+
+# Error message fragments that indicate there is no active voice chat.
+# These come from Telegram's MTProto layer and are stable across versions.
+_NO_CALL_PHRASES = (
+    "no_active_group_call",
+    "groupcall_not_found",
+    "not_found",
+    "no active",
+)
+
+
+def _is_no_active_call(exc: Exception) -> bool:
+    """Return True when *exc* indicates no voice chat is running in the group."""
+    msg = str(exc).lower()
+    return any(phrase in msg for phrase in _NO_CALL_PHRASES)
 
 
 class VoiceChatManager:
@@ -54,10 +66,10 @@ class VoiceChatManager:
 
     def set_on_stream_end(self, callback: StreamEndCallback) -> None:
         """
-        Register the coroutine that is awaited when a stream finishes naturally.
+        Register the coroutine awaited when a stream finishes naturally.
 
-        Called by the lifecycle AFTER MusicEngine is created, breaking the
-        circular dependency (engine -> vc_manager -> engine).
+        Called by the lifecycle layer AFTER MusicEngine is created, breaking
+        the circular dependency (engine -> vc_manager -> engine).
         """
         self._on_stream_end = callback
 
@@ -68,7 +80,7 @@ class VoiceChatManager:
         logger.info("PyTgCalls engine started")
 
     async def stop(self) -> None:
-        """Leave all active voice chats and shut down PyTgCalls."""
+        """Leave all active voice chats and shut down."""
         for chat_id in list(self._active):
             await self._safe_leave(chat_id)
         self._active.clear()
@@ -79,7 +91,11 @@ class VoiceChatManager:
         """
         Join the voice chat and start streaming.
 
-        Returns True on success, False when no active voice chat exists.
+        Returns True on success, False when no active voice chat exists in
+        the group.
+
+        If the bot is already connected, falls back to change_stream so the
+        caller does not need to track connection state explicitly.
         """
         try:
             await self._tgcalls.play(chat_id, stream)
@@ -87,40 +103,62 @@ class VoiceChatManager:
             logger.info("VC join+play  chat_id={}", chat_id)
             return True
 
-        except AlreadyJoinedError:
-            # Already connected — swap stream instead
-            return await self.change_stream(chat_id, stream)
-
-        except NoActiveGroupCall:
-            logger.warning("No active voice chat  chat_id={}", chat_id)
-            return False
-
-        except TelegramServerError as exc:
-            logger.error("Telegram server error during play  chat_id={}  error={}", chat_id, exc)
-            return False
-
         except Exception as exc:
-            logger.error("VC play failed  chat_id={}  error={}", chat_id, exc)
-            return False
+            if _is_no_active_call(exc):
+                logger.warning(
+                    "No active voice chat in group  chat_id={}  error={}",
+                    chat_id, exc,
+                )
+                return False
+
+            # Any other failure (including "already joined" variants) —
+            # attempt change_stream, which also handles a fresh join if needed.
+            logger.debug(
+                "play() raised, retrying via change_stream  chat_id={}  error={}",
+                chat_id, exc,
+            )
+            return await self.change_stream(chat_id, stream)
 
     async def change_stream(self, chat_id: int, stream: MediaStream) -> bool:
         """
-        Replace the running stream (used for skip / auto-advance).
-        Falls back to a fresh join if the bot is somehow no longer in the VC.
+        Replace the currently running stream (used for skip / auto-advance).
+
+        Falls back to a fresh play() call if the bot is somehow no longer
+        connected.
         """
         try:
             await self._tgcalls.change_stream(chat_id, stream)
+            self._active.add(chat_id)
             logger.debug("Stream changed  chat_id={}", chat_id)
             return True
 
         except Exception as exc:
-            # In py-tgcalls 2.x, being "not in call" raises a generic error;
-            # attempt a fresh join before giving up.
+            if _is_no_active_call(exc):
+                logger.warning(
+                    "No active VC during change_stream  chat_id={}  error={}",
+                    chat_id, exc,
+                )
+                self._active.discard(chat_id)
+                return False
+
+            # Likely "not in call" — attempt a completely fresh join.
             logger.warning(
-                "change_stream failed, attempting fresh join  chat_id={}  error={}",
+                "change_stream failed, attempting fresh join  "
+                "chat_id={}  error={}",
                 chat_id, exc,
             )
-            return await self.play(chat_id, stream)
+            try:
+                await self._tgcalls.play(chat_id, stream)
+                self._active.add(chat_id)
+                return True
+            except Exception as exc2:
+                logger.error(
+                    "Fresh join after change_stream failure also failed  "
+                    "chat_id={}  error={}",
+                    chat_id, exc2,
+                )
+                self._active.discard(chat_id)
+                return False
 
     async def leave(self, chat_id: int) -> None:
         """Leave the voice chat and remove from the active set."""
@@ -160,12 +198,13 @@ class VoiceChatManager:
             logger.debug("leave_call suppressed  chat_id={}  error={}", chat_id, exc)
 
     def _register_callbacks(self) -> None:
-        """Attach py-tgcalls 2.x event handlers (must be called before start())."""
+        """Attach py-tgcalls event handlers (must be called before start())."""
 
         @self._tgcalls.on_stream_end()
         async def _on_stream_end(_client: PyTgCalls, update: Update) -> None:
             chat_id: int = update.chat_id
             logger.info("Stream ended naturally  chat_id={}", chat_id)
+            self._active.discard(chat_id)
             if self._on_stream_end is not None:
                 try:
                     await self._on_stream_end(chat_id)
