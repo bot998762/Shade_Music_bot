@@ -3,9 +3,17 @@ pyrogram==2.0.106          # MTProto client (bot + optional user assistant)
 TgCrypto==1.2.5            # Fast crypto for pyrogram (C ext — needs libc6-dev in builder)
 
 # ─── Voice Chat Streaming ─────────────────────────────────────────────────────
-# pytgcalls 0.10+ uses the ntgcalls backend which ships pre-built Linux x86_64
-# binaries — no C compilation needed in Docker. Python 3.12 compatible.
-pytgcalls>=0.10.6
+# IMPORTANT: the PyPI package is "py-tgcalls", NOT "pytgcalls".
+# "pytgcalls" (no dash) is the old abandoned package that depends on the
+# broken tgcalls C++ extension and causes ResolutionImpossible on Python 3.12.
+# "py-tgcalls" is the current maintained package; it uses ntgcalls which ships
+# pre-built binaries for Linux x86_64 — zero C++ compilation required.
+# Both packages expose the same import name: `from pytgcalls import PyTgCalls`.
+py-tgcalls>=2.0.0
+
+# ntgcalls is pulled in automatically by py-tgcalls, but pinning it explicitly
+# ensures pip picks a wheel-only release (no source build on Render).
+ntgcalls>=1.3.0
 
 # ─── YouTube / Audio ──────────────────────────────────────────────────────────
 yt-dlp>=2024.1.0           # YouTube search and stream extraction

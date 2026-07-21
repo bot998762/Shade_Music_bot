@@ -1,57 +1,52 @@
 """
 app.streaming.ffmpeg
 ~~~~~~~~~~~~~~~~~~~~
-Centralised factory for pytgcalls ``MediaStream`` objects.
+Centralised factory for pytgcalls MediaStream objects.
 
-All pytgcalls / FFmpeg configuration lives here so future phases can add
-quality presets, video support, or custom ffmpeg_parameters in one place
-without touching handlers or the engine.
-
-pytgcalls (0.10+) uses ntgcalls internally for audio processing.
-FFmpeg must be installed on the host for format conversion fallbacks.
+py-tgcalls 2.x API notes
+-------------------------
+* Install package name : py-tgcalls  (NOT the old pytgcalls on PyPI)
+* Import name          : from pytgcalls.types import MediaStream, AudioQuality
+* Audio quality        : pass AudioQuality.<LEVEL> directly as audio_parameters
+                         There is no AudioParameters wrapper class in 2.x.
+* Audio-only streams   : must set video_flags=MediaStream.IGNORE so
+                         pytgcalls does not wait for a video track.
 """
 
 from __future__ import annotations
 
-from pytgcalls.types import MediaStream, AudioParameters, AudioQuality
-
-
-class AudioQualityPreset:
-    """Named quality presets mapping to pytgcalls ``AudioQuality`` values."""
-    LOW    = AudioQuality.LOW     # 48 kbps
-    MEDIUM = AudioQuality.MEDIUM  # 128 kbps (default)
-    HIGH   = AudioQuality.HIGH    # 256 kbps
-    STUDIO = AudioQuality.STUDIO  # 320 kbps
+from pytgcalls.types import AudioQuality, MediaStream
 
 
 class FFmpegStreamBuilder:
     """
-    Builds ``MediaStream`` objects for pytgcalls.
+    Builds MediaStream objects for py-tgcalls 2.x.
 
     Usage
     -----
     stream = FFmpegStreamBuilder.build(url)
-    stream = FFmpegStreamBuilder.build(url, quality=AudioQualityPreset.HIGH)
+    stream = FFmpegStreamBuilder.build(url, quality=AudioQuality.HIGH)
     """
 
     @staticmethod
     def build(
         stream_url: str,
-        quality: AudioQuality = AudioQuality.MEDIUM,
+        quality: AudioQuality = AudioQuality.HIGH,
     ) -> MediaStream:
         """
-        Create a ``MediaStream`` ready to pass to pytgcalls.
+        Create a MediaStream ready to pass to PyTgCalls.play() or
+        PyTgCalls.change_stream().
 
         Parameters
         ----------
         stream_url:
-            Direct audio URL returned by :class:`~app.services.youtube.YouTubeService`.
+            Direct audio URL returned by YouTubeService.
         quality:
-            One of the ``AudioQualityPreset`` constants.  Defaults to MEDIUM
-            (128 kbps) which balances quality against bandwidth on Render's
-            free-tier network.
+            AudioQuality.LOW | .MEDIUM | .HIGH | .STUDIO
+            Defaults to HIGH for good quality without excessive bandwidth.
         """
         return MediaStream(
             stream_url,
-            audio_parameters=AudioParameters(quality),
+            audio_parameters=quality,        # AudioQuality passed directly (no wrapper)
+            video_flags=MediaStream.IGNORE,  # audio-only: do not wait for video track
         )
