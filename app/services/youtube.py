@@ -3,29 +3,41 @@ app.services.youtube
 ~~~~~~~~~~~~~~~~~~~~
 YouTube search and audio-stream extraction via yt-dlp.
 
-Design rules
-------------
-* yt-dlp is synchronous — every call runs in a thread-pool executor so
-  the asyncio event loop is never blocked.
-* We store only the permanent ``webpage_url`` from search results.
-  A fresh, short-lived ``stream_url`` is fetched immediately before
-  each playback attempt; it is never cached.
-* cookies.txt is used when present; the bot works without it (public
-  videos only).  A missing cookies file never causes a crash.
-* All yt-dlp errors are caught and re-raised as ``None``; callers never
-  see an unhandled exception.
-* Format resolution uses a cascading fallback chain — the bot never dies
-  because one container (m4a / webm) is unavailable for a given video.
+Root cause of "Requested format is not available" on Render
+------------------------------------------------------------
+yt-dlp's default player client is ``web``.  Since ~2024, YouTube requires a
+*Proof-of-Origin (PO) Token* for web-client requests that originate from
+server/datacenter IPs (Render, AWS, GCP, etc.).  Without that token the
+format list returned by YouTube is empty — every selector, including "best",
+raises "Requested format is not available".  Switching to the ``android_vr``
+client bypasses the PO Token requirement entirely.
 
-Format-fallback strategy
-------------------------
-Priority   Selector                                    Notes
---------   -----------------------------------------   --------------------------
-1          bestaudio[ext=m4a]/bestaudio[ext=webm]/     Ideal: pure audio, small
-           bestaudio/best
-2          bestaudio/best                               Any audio, no container
-3          best                                         Combined a/v as last resort
-MANUAL     (no selector — scan formats[])               Absolute last resort
+This is configured in ``_BASE_OPTS`` via::
+
+    "extractor_args": {
+        "youtube": {"player_client": ["android_vr", "ios", "web"]}
+    }
+
+Stream-URL extraction strategy
+--------------------------------
+Stage 1 — Dynamic (primary)
+    Call ``extract_info(..., process=False)`` to obtain the raw format list
+    with all streaming URLs already decrypted by the extractor.  ``process=False``
+    skips ``process_ie_result()`` — the step that runs format *selection* and
+    raises the "not available" error — so it can never fail on format grounds.
+    We then pick the best audio track ourselves via ``_pick_audio_url()``.
+
+Stage 2 — Selector fallback
+    If Stage 1 returns nothing (edge case: some extractors don't populate
+    ``formats[]`` in unprocessed mode), try ``bestaudio/best`` then ``best``
+    as explicit selectors.  With ``android_vr`` in ``_BASE_OPTS`` these now
+    resolve reliably even without cookies.
+
+Search
+------
+``extract_flat="in_playlist"`` prevents yt-dlp from resolving formats during
+search (we only need metadata).  Without this, yt-dlp validates every result's
+format list and fails for videos with unusual codecs (iamf, AV1-only, etc.).
 """
 
 from __future__ import annotations
@@ -41,25 +53,11 @@ import yt_dlp.utils
 from app.core.logger import logger
 from app.player.models import Track
 
-# Single bounded executor — avoids spawning unlimited threads on Render.
+# Bounded executor — 3 threads is enough; yt-dlp calls are I/O-bound.
 _YT_EXECUTOR = ThreadPoolExecutor(max_workers=3, thread_name_prefix="ytdlp")
 
-# ── Format fallback chain ─────────────────────────────────────────────────────
-# Each entry is tried in sequence for stream-URL resolution.  We stop at the
-# first success.  Using three stages means every video on YouTube will resolve
-# to *some* playable URL regardless of which renditions the uploader has enabled.
-
-_FORMAT_CHAIN: List[str] = [
-    # Stage 1 — pure audio, prefer m4a (AAC, natively compatible) then webm (Opus)
-    "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
-    # Stage 2 — any bestaudio regardless of container
-    "bestaudio/best",
-    # Stage 3 — absolute fallback: any format (muxed a+v is fine; FFmpeg extracts audio)
-    "best",
-]
-
-# Lower-cased substrings present in yt-dlp errors that mean "format not available".
-# These are safe to retry with the next format selector.
+# Substrings that identify a yt-dlp format-availability error.
+# We use these only in Stage 2 to decide whether to try the next selector.
 _FORMAT_ERR_PHRASES = (
     "requested format is not available",
     "no video formats found",
@@ -68,7 +66,6 @@ _FORMAT_ERR_PHRASES = (
 )
 
 # ── HTTP headers ──────────────────────────────────────────────────────────────
-# Mimic a modern browser so YouTube does not serve bot-detection challenges.
 _HTTP_HEADERS: Dict[str, str] = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) "
@@ -82,67 +79,163 @@ _HTTP_HEADERS: Dict[str, str] = {
     ),
 }
 
-# ── Base yt-dlp options applied to every call ─────────────────────────────────
+# ── Base options (applied to every yt-dlp call) ───────────────────────────────
+#
+# player_client priority:
+#   android_vr — no PO Token required, full DASH format list, most reliable
+#   ios        — no PO Token required, good fallback
+#   web        — requires PO Token on server IPs; last resort (works with cookies)
 _BASE_OPTS: Dict = {
-    # Silence yt-dlp's own stdout/stderr — we handle all output via loguru.
     "quiet": True,
     "no_warnings": True,
-    # Safety / reliability
-    "noplaylist": True,          # never accidentally pull a whole playlist
-    "extract_flat": False,       # always resolve full metadata
-    "geo_bypass": True,          # attempt to bypass geo-restrictions automatically
-    "nocheckcertificate": True,  # avoids SSL issues on some VPS / Render environments
-    # Network resilience
-    "source_address": "0.0.0.0",  # bind to IPv4; avoids IPv6 timeouts on Render
-    "socket_timeout": 30,          # per-socket timeout in seconds
-    "retries": 5,                  # retry failed HTTP requests up to 5 times
-    "fragment_retries": 5,         # retry DASH / HLS segment failures
-    # Browser impersonation
+    "noplaylist": True,
+    "geo_bypass": True,
+    "nocheckcertificate": True,
+    "socket_timeout": 15,
+    "retries": 3,
+    "fragment_retries": 3,
     "http_headers": _HTTP_HEADERS,
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android_vr", "ios", "web"],
+        }
+    },
 }
 
-# ── Search-specific options ───────────────────────────────────────────────────
-# KEY: extract_flat="in_playlist" prevents yt-dlp from doing per-entry format
-# resolution during search.  Without this, yt-dlp validates which audio/video
-# renditions the video exposes, and for any video with an unusual codec
-# (e.g. iamf.001.001.Opus, AV1-only, DRC formats) it raises
-# "Requested format is not available" before returning any metadata at all.
-#
-# With extract_flat="in_playlist" yt-dlp returns the entry's title, id, url,
-# duration, uploader and thumbnail directly from the YouTube search API
-# response — no codec or format negotiation is attempted.  We resolve the
-# actual stream URL separately, just before playback, via _sync_get_stream_url.
+# ── Search options ────────────────────────────────────────────────────────────
+# extract_flat="in_playlist" → metadata only, zero format resolution.
+# Overrides _BASE_OPTS which has no extract_flat key (defaults to False).
 _SEARCH_OPTS: Dict = {
     **_BASE_OPTS,
-    "extract_flat": "in_playlist",  # metadata-only; overrides _BASE_OPTS False
+    "extract_flat": "in_playlist",
     "default_search": "ytsearch",
     "skip_download": True,
 }
 
 # ── Stream-resolution base options ────────────────────────────────────────────
-# The "format" key is injected per-attempt inside _sync_get_stream_url so that
-# different stages of the fallback chain can use different selectors.
+# No "format" key — Stage 1 bypasses selection entirely; Stage 2 injects it
+# per-attempt so we never re-use the same selector.
 _STREAM_BASE_OPTS: Dict = {
     **_BASE_OPTS,
     "skip_download": True,
 }
 
 
+# ── Module-level helpers (no class state) ─────────────────────────────────────
+
+def _pick_audio_url(formats: List[Dict]) -> Optional[str]:
+    """
+    Choose the best audio stream URL from a raw yt-dlp formats list.
+
+    Never hard-codes a container name or codec — works on whatever the
+    extractor actually returns.
+
+    Priority
+    --------
+    1. Audio-only streams (vcodec = none), highest bitrate first.
+    2. Combined a+v streams with audio, lowest resolution first
+       (minimises unnecessary video data sent to FFmpeg).
+    3. Any HTTP/HTTPS URL as absolute last resort.
+
+    Skips manifests (m3u8, mpd) and non-HTTP protocols (rtmp, mms)
+    because they require special demuxer setup; FFmpeg can handle a plain
+    HTTPS DASH segment URL directly.
+    """
+    if not formats:
+        return None
+
+    def _is_direct(f: Dict) -> bool:
+        url = f.get("url", "")
+        proto = f.get("protocol", "https")
+        return url.startswith("http") and proto not in (
+            "m3u8", "m3u8_native", "rtmp", "rtmpe", "mms",
+        )
+
+    # Allow m3u8 only as a last resort (FFmpeg handles HLS natively)
+    direct = [f for f in formats if _is_direct(f)]
+    if not direct:
+        direct = [f for f in formats if f.get("url", "").startswith("http")]
+    if not direct:
+        return None
+
+    # ── Priority 1: audio-only ────────────────────────────────────────────
+    audio_only = [
+        f for f in direct
+        if f.get("vcodec") in (None, "none")
+        and f.get("acodec") not in (None, "none")
+    ]
+    if audio_only:
+        best = max(
+            audio_only,
+            key=lambda f: float(f.get("abr") or f.get("tbr") or 0),
+        )
+        logger.debug(
+            "pick: audio-only ext={} abr={}kbps acodec={}",
+            best.get("ext", "?"),
+            best.get("abr", "?"),
+            best.get("acodec", "?"),
+        )
+        return best["url"]
+
+    # ── Priority 2: combined a+v with an audio track ──────────────────────
+    has_audio = [
+        f for f in direct
+        if f.get("acodec") not in (None, "none")
+    ]
+    if has_audio:
+        best = min(
+            has_audio,
+            key=lambda f: (
+                f.get("height") or 9999,
+                -(float(f.get("abr") or 0)),
+            ),
+        )
+        logger.debug(
+            "pick: combined a+v ext={} height={}",
+            best.get("ext", "?"),
+            best.get("height", "?"),
+        )
+        return best["url"]
+
+    # ── Priority 3: any format with a URL ─────────────────────────────────
+    for fmt in reversed(direct):
+        if fmt.get("url"):
+            logger.debug("pick: last-resort ext={}", fmt.get("ext", "?"))
+            return fmt["url"]
+
+    return None
+
+
+def _pick_url_from_info(info: Optional[Dict]) -> Optional[str]:
+    """
+    Extract a playable URL from a fully-processed yt-dlp info dict.
+
+    When yt-dlp ran format selection it puts the chosen URL directly in
+    ``info["url"]``.  Falls back to scanning ``info["formats"]`` when that
+    key is absent.
+    """
+    if not info:
+        return None
+    if url := info.get("url"):
+        return url
+    return _pick_audio_url(info.get("formats") or [])
+
+
+# ── Service class ─────────────────────────────────────────────────────────────
+
 class YouTubeService:
     """
-    Wraps yt-dlp to provide async search and stream-URL extraction.
+    Async YouTube search and stream-URL extraction backed by yt-dlp.
 
     Parameters
     ----------
     cookies_path:
-        Optional path to a Netscape-format cookies.txt file.  When the
-        file exists it is used automatically.  When missing or ``None``
-        the service operates without cookies (public videos only).
+        Optional path to a Netscape-format cookies.txt.  Used automatically
+        when the file exists; the service works without it for public videos.
     """
 
     def __init__(self, cookies_path: Optional[str] = None) -> None:
         self._cookies_path: Optional[str] = None
-
         if cookies_path and os.path.isfile(cookies_path):
             self._cookies_path = cookies_path
             logger.info("YouTube: cookies.txt loaded from '{}'", cookies_path)
@@ -163,9 +256,9 @@ class YouTubeService:
         """
         Search YouTube for *query* and return the first result as a Track.
 
-        Returns ``None`` when no results are found or yt-dlp raises an error.
-        The returned Track contains a permanent ``webpage_url`` but no
-        stream URL — call :meth:`get_stream_url` immediately before playback.
+        Returns ``None`` on failure.  The Track carries only metadata and a
+        permanent ``webpage_url``; stream URL is resolved separately, just
+        before playback.
         """
         logger.info("YouTube search: '{}'", query)
         loop = asyncio.get_event_loop()
@@ -181,12 +274,7 @@ class YouTubeService:
         """
         Resolve *webpage_url* to a direct audio stream URL.
 
-        Uses a cascading format-selector chain so playback always succeeds
-        even when a specific container (m4a / webm) is unavailable for a
-        given video.
-
-        Always call this immediately before starting playback — the URL
-        returned by YouTube expires quickly and must never be stored.
+        Always call this immediately before playback — the URL expires quickly.
         Returns ``None`` on failure.
         """
         loop = asyncio.get_event_loop()
@@ -196,10 +284,10 @@ class YouTubeService:
             webpage_url,
         )
 
-    # ── Private sync workers (run inside ThreadPoolExecutor) ──────────────────
+    # ── Private sync workers ──────────────────────────────────────────────────
 
     def _build_opts(self, base: Dict) -> Dict:
-        """Merge *base* options with cookies path when available."""
+        """Merge *base* options with cookies when available."""
         opts = dict(base)
         if self._cookies_path:
             opts["cookiefile"] = self._cookies_path
@@ -213,304 +301,230 @@ class YouTubeService:
         requested_by_id: int,
         requested_by_name: str,
     ) -> Optional[Track]:
-        """
-        Synchronous YouTube search (runs in executor).
-
-        Uses ``ytsearch1:`` prefix so yt-dlp executes a YouTube search and
-        returns the first result.  No format selector is specified — we only
-        need metadata, not a playback URL.
-        """
         opts = self._build_opts(_SEARCH_OPTS)
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(f"ytsearch1:{query}", download=False)
 
             if not info:
-                logger.warning("YouTube search: no info returned for '{}'", query)
+                logger.warning("Search: no info for '{}'", query)
                 return None
 
             entries = info.get("entries")
             if not entries:
-                logger.warning("YouTube search: no entries for '{}'", query)
+                logger.warning("Search: no entries for '{}'", query)
                 return None
 
             entry = entries[0]
 
-            # ── webpage_url ───────────────────────────────────────────────
-            # With extract_flat="in_playlist" the entry's "url" field holds
-            # the watch URL (https://www.youtube.com/watch?v=ID).
-            # "webpage_url" is only present on fully-extracted entries.
-            # We fall back to constructing it from the video ID when both
-            # fields are absent (should never happen for YouTube, but safe).
+            # With extract_flat="in_playlist", webpage_url is absent.
+            # "url" holds the watch URL; fall back to constructing from "id".
             video_id: str = entry.get("id") or ""
             webpage_url: str = (
                 entry.get("webpage_url")
                 or entry.get("url")
-                or (f"https://www.youtube.com/watch?v={video_id}" if video_id else "")
+                or (
+                    f"https://www.youtube.com/watch?v={video_id}"
+                    if video_id else ""
+                )
             )
             if not webpage_url:
-                logger.warning(
-                    "YouTube search: could not determine webpage_url for '{}'", query
-                )
+                logger.warning("Search: could not determine webpage_url for '{}'", query)
                 return None
 
-            # ── thumbnail ─────────────────────────────────────────────────
-            # Flat entries may carry a single "thumbnail" string or a
-            # "thumbnails" list [{url, width, height}, ...].  We prefer the
-            # highest-resolution thumbnail (last item in the sorted list).
+            # Thumbnail: scalar field or last item in thumbnails list
             thumbnail: Optional[str] = entry.get("thumbnail")
             if thumbnail is None:
                 thumbs: list = entry.get("thumbnails") or []
                 if thumbs:
                     thumbnail = thumbs[-1].get("url")
 
-            # ── uploader ──────────────────────────────────────────────────
-            uploader: str = (
-                entry.get("uploader")
-                or entry.get("channel")
-                or entry.get("uploader_id")
-                or "Unknown"
-            )
-
             track = Track(
                 title=entry.get("title") or "Unknown Title",
                 duration=int(entry.get("duration") or 0),
                 webpage_url=webpage_url,
-                uploader=uploader,
+                uploader=(
+                    entry.get("uploader")
+                    or entry.get("channel")
+                    or entry.get("uploader_id")
+                    or "Unknown"
+                ),
                 thumbnail=thumbnail,
                 requested_by_id=requested_by_id,
                 requested_by_name=requested_by_name,
             )
             logger.info(
-                "YouTube search OK: query='{}' → title='{}' duration={}s url='{}'",
-                query,
-                track.title,
-                track.duration,
-                webpage_url,
+                "Search OK: '{}' → title='{}' duration={}s url='{}'",
+                query, track.title, track.duration, webpage_url,
             )
             return track
 
         except yt_dlp.utils.DownloadError as exc:
-            logger.error(
-                "yt-dlp DownloadError during search '{}': {}", query, exc
-            )
+            logger.error("DownloadError during search '{}': {}", query, exc)
             return None
         except yt_dlp.utils.ExtractorError as exc:
-            logger.error(
-                "yt-dlp ExtractorError during search '{}': {}", query, exc
-            )
+            logger.error("ExtractorError during search '{}': {}", query, exc)
             return None
         except Exception as exc:
-            logger.error(
-                "yt-dlp unexpected error during search '{}': {}", query, exc
-            )
+            logger.error("Unexpected error during search '{}': {}", query, exc)
             return None
 
     # ── Stream URL resolution ─────────────────────────────────────────────────
 
     def _sync_get_stream_url(self, webpage_url: str) -> Optional[str]:
         """
-        Synchronous stream-URL resolution (runs in executor).
+        Two-stage stream URL resolution.
 
-        Tries each format selector in ``_FORMAT_CHAIN`` in order.  On a
-        format-availability error it logs a warning and moves to the next
-        selector.  After all selectors are exhausted it falls back to
-        ``_manual_format_scan`` which queries all formats and picks the
-        best audio track manually.
+        Stage 1 — Dynamic (primary)
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        ``extract_info(process=False)`` runs the YouTube extractor (including
+        nsig URL decryption) but skips ``process_ie_result()`` — the function
+        that validates format availability and raises "not available".  We
+        receive the full raw format list and pick the best audio track with
+        ``_pick_audio_url()``, which inspects actual format properties (vcodec,
+        acodec, abr) without assuming any specific container or codec exists.
 
-        Non-format errors (geo-block, age-gate, private video, network
-        error) abort immediately and return ``None``.
+        Stage 2 — Selector fallback
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        If Stage 1 yields nothing (rare: some extractors don't populate
+        ``formats[]`` without processing), try ``bestaudio/best`` then ``best``
+        as explicit selectors.  With ``player_client=["android_vr"]`` in
+        ``_BASE_OPTS``, these selectors now resolve successfully from server IPs.
+        Unlike the old 3-selector chain, each selector here is genuinely
+        different and only tried once.
         """
-        last_format_error: Optional[Exception] = None
+        logger.debug("Resolving stream URL for '{}'", webpage_url)
 
-        for attempt, fmt in enumerate(_FORMAT_CHAIN, start=1):
+        # ── Stage 1: dynamic format inspection ────────────────────────────
+        url = self._dynamic_extract(webpage_url)
+        if url:
+            return url
+
+        # ── Stage 2: explicit selector fallback ───────────────────────────
+        for fmt in ("bestaudio/best", "best"):
             opts = self._build_opts({**_STREAM_BASE_OPTS, "format": fmt})
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(webpage_url, download=False)
-
                 url = _pick_url_from_info(info)
                 if url:
                     logger.info(
-                        "yt-dlp stream resolved — "
-                        "attempt={}/{} format='{}' url_chars={}",
-                        attempt,
-                        len(_FORMAT_CHAIN),
-                        fmt,
-                        len(url),
+                        "Stream OK via selector='{}' url_chars={} for '{}'",
+                        fmt, len(url), webpage_url,
                     )
                     return url
 
-                # extract_info returned something but no URL could be found.
-                logger.warning(
-                    "yt-dlp attempt={} format='{}' produced no URL for '{}', "
-                    "trying next fallback",
-                    attempt,
-                    fmt,
-                    webpage_url,
-                )
-
             except yt_dlp.utils.DownloadError as exc:
-                err_lower = str(exc).lower()
-                if any(phrase in err_lower for phrase in _FORMAT_ERR_PHRASES):
+                if any(p in str(exc).lower() for p in _FORMAT_ERR_PHRASES):
                     logger.warning(
-                        "yt-dlp attempt={}/{} format='{}' not available for '{}' "
-                        "→ trying next fallback",
-                        attempt,
-                        len(_FORMAT_CHAIN),
-                        fmt,
-                        webpage_url,
+                        "Selector '{}' unavailable for '{}' — {}",
+                        fmt, webpage_url, exc,
                     )
-                    last_format_error = exc
-                    continue  # move to next format selector
-
-                # Non-format error: geo-block, age-gate, private, network, etc.
-                # These won't be fixed by trying a different format selector.
+                    continue  # try next selector
+                # Non-format errors (geo-block, age-gate, private video)
+                # won't be fixed by a different selector.
                 logger.error(
-                    "yt-dlp DownloadError (non-format) for '{}': {}",
-                    webpage_url,
-                    exc,
+                    "DownloadError (non-format) for '{}': {}", webpage_url, exc
                 )
                 return None
 
             except yt_dlp.utils.ExtractorError as exc:
-                logger.error(
-                    "yt-dlp ExtractorError for '{}': {}", webpage_url, exc
-                )
+                logger.error("ExtractorError for '{}': {}", webpage_url, exc)
                 return None
 
             except Exception as exc:
-                logger.error(
-                    "yt-dlp unexpected error for '{}': {}", webpage_url, exc
-                )
+                logger.error("Unexpected error for '{}': {}", webpage_url, exc)
                 return None
-
-        # ── All format selectors exhausted ────────────────────────────────────
-        logger.warning(
-            "All {} format selectors failed for '{}' (last error: {}), "
-            "falling back to manual format scan",
-            len(_FORMAT_CHAIN),
-            webpage_url,
-            last_format_error,
-        )
-        url = self._manual_format_scan(webpage_url)
-        if url:
-            return url
 
         logger.error(
-            "yt-dlp: could not resolve any playable URL for '{}' "
-            "after {} attempts + manual scan",
+            "All extraction strategies exhausted for '{}'. "
+            "Video may be DRM-protected, age-gated, or region-locked.",
             webpage_url,
-            len(_FORMAT_CHAIN),
         )
         return None
 
-    def _manual_format_scan(self, webpage_url: str) -> Optional[str]:
+    def _dynamic_extract(self, webpage_url: str) -> Optional[str]:
         """
-        Last-resort format resolution.
+        Fetch the complete raw format list and pick the best audio URL.
 
-        Fetches the full format list without a selector and manually picks
-        the best audio-only stream by bitrate, falling back to any format
-        that has a URL.
+        Uses ``extract_info(process=False)`` which runs the extractor
+        (including signature/nsig decryption) but skips format selection.
+        The returned ``formats[]`` list contains decrypted streaming URLs for
+        every rendition YouTube exposes via the ``android_vr`` client — DASH
+        audio tracks, combined mp4, etc. — without any filtering.
+
+        We then score and select from those formats dynamically, never
+        assuming that m4a, webm, or any other specific container is present.
         """
-        # No "format" key → yt-dlp returns all available formats.
-        opts = self._build_opts({**_STREAM_BASE_OPTS})
+        opts = self._build_opts(_STREAM_BASE_OPTS)
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(webpage_url, download=False)
+                raw = ydl.extract_info(webpage_url, download=False, process=False)
 
-            if not info:
+            if not raw:
+                logger.debug("Dynamic: no raw info for '{}'", webpage_url)
                 return None
 
-            # Some extractors put the URL directly on the top-level dict.
-            if direct_url := info.get("url"):
-                logger.info(
-                    "Manual scan: direct URL found on info root for '{}'",
-                    webpage_url,
-                )
-                return direct_url
+            # Resolve single-level redirect entries (url / url_transparent).
+            entry: Dict = raw
+            if raw.get("_type") in ("url", "url_transparent") and raw.get("url"):
+                try:
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        inner = ydl.extract_info(
+                            raw["url"], download=False, process=False
+                        )
+                    if inner:
+                        entry = inner
+                except Exception:
+                    pass  # use the original entry
 
-            formats: List[Dict] = info.get("formats") or []
+            formats: List[Dict] = entry.get("formats") or []
+
+            # Log a compact summary so format issues are diagnosable in Render logs.
+            if formats:
+                sample = [
+                    f"{f.get('ext','?')}/"
+                    f"{'audio' if f.get('vcodec') in (None,'none') else 'video'}/"
+                    f"{f.get('abr') or f.get('tbr') or '?'}kbps"
+                    for f in formats[:8]
+                ]
+                logger.debug(
+                    "Dynamic: {} formats for '{}' — sample: {}",
+                    len(formats), webpage_url, ", ".join(sample),
+                )
+
             if not formats:
-                return None
-
-            # Priority 1: audio-only streams (vcodec=none), best bitrate first.
-            audio_only = [
-                f for f in formats
-                if f.get("vcodec") in (None, "none")
-                and f.get("acodec") not in (None, "none")
-                and f.get("url")
-            ]
-            if audio_only:
-                best = max(
-                    audio_only,
-                    key=lambda f: float(f.get("abr") or f.get("tbr") or 0),
-                )
-                logger.info(
-                    "Manual scan: selected audio-only ext={} abr={}kbps for '{}'",
-                    best.get("ext", "?"),
-                    best.get("abr", "?"),
-                    webpage_url,
-                )
-                return best["url"]
-
-            # Priority 2: combined a+v (FFmpeg will extract the audio track).
-            for fmt in reversed(formats):
-                if fmt.get("url"):
+                # Some extractors put a direct URL on the root entry.
+                if (direct := entry.get("url", "")).startswith("http"):
                     logger.info(
-                        "Manual scan: fallback to combined ext={} for '{}' "
-                        "(FFmpeg will extract audio)",
-                        fmt.get("ext", "?"),
+                        "Dynamic: direct root URL (no formats[]) for '{}'",
                         webpage_url,
                     )
-                    return fmt["url"]
+                    return direct
+                logger.debug(
+                    "Dynamic: empty formats[] and no root url for '{}'",
+                    webpage_url,
+                )
+                return None
+
+            url = _pick_audio_url(formats)
+            if url:
+                logger.info(
+                    "Dynamic OK: {} formats scanned → url_chars={} for '{}'",
+                    len(formats), len(url), webpage_url,
+                )
+            else:
+                logger.warning(
+                    "Dynamic: {} formats found but none yielded a usable URL for '{}'",
+                    len(formats), webpage_url,
+                )
+            return url
 
         except Exception as exc:
-            logger.error(
-                "yt-dlp manual format scan failed for '{}': {}",
-                webpage_url,
-                exc,
+            # process=False can still raise if the extractor itself fails
+            # (network error, video deleted, etc.).  Treat as non-fatal here;
+            # Stage 2 will attempt the selector approach.
+            logger.warning(
+                "Dynamic extract exception for '{}': {}", webpage_url, exc
             )
-
-        return None
-
-
-# ── Module-level helper — no class state needed ───────────────────────────────
-
-def _pick_url_from_info(info: Optional[Dict]) -> Optional[str]:
-    """
-    Extract the best audio URL from a yt-dlp info dict.
-
-    When yt-dlp uses a format selector it pre-selects a format and puts its
-    URL directly on ``info["url"]``.  If that key is absent (e.g. for
-    multi-format responses) we fall back to scanning ``info["formats"]``.
-    """
-    if not info:
-        return None
-
-    # Fast path — yt-dlp already selected and resolved a format.
-    if url := info.get("url"):
-        return url
-
-    # Slow path — scan formats and pick the best audio-only entry.
-    formats: List[Dict] = info.get("formats") or []
-
-    audio_only = [
-        f for f in formats
-        if f.get("vcodec") in (None, "none")
-        and f.get("acodec") not in (None, "none")
-        and f.get("url")
-    ]
-    if audio_only:
-        best = max(
-            audio_only,
-            key=lambda f: float(f.get("abr") or f.get("tbr") or 0),
-        )
-        return best["url"]
-
-    # Absolute last resort: any format with a URL.
-    for fmt in reversed(formats):
-        if fmt.get("url"):
-            return fmt["url"]
-
-    return None
+            return None
