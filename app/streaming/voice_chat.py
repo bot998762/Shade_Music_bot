@@ -16,6 +16,20 @@ base class and inspect the message string where the error type matters.
 
 The only external exception we import is ntgcalls.NTgCallsError, which
 comes from the separate ntgcalls package and has been stable.
+
+Event-API compatibility note (py-tgcalls >= 2.1)
+-------------------------------------------------
+The legacy per-event decorator methods  — on_stream_end(), on_kicked(),
+on_closed_voice_chat() — were removed in py-tgcalls ~2.1.  The current
+API is a single on_update() handler with optional filter objects:
+
+    @tgcalls.on_update()                              # all updates
+    @tgcalls.on_update(fl.chat_update(Status.LEFT))  # chat-level events
+
+Stream-end updates are identified by isinstance() checks against the
+StreamEnded type (introduced in ~2.1, previously StreamAudioEnded).
+Both names are attempted at import time so the file stays compatible
+with every 2.x release.
 """
 
 from __future__ import annotations
@@ -25,7 +39,44 @@ from typing import Awaitable, Callable, Optional, Set
 
 from pyrogram import Client
 from pytgcalls import PyTgCalls
+from pytgcalls import filters as fl
 from pytgcalls.types import MediaStream, Update
+
+# ---------------------------------------------------------------------------
+# ChatUpdate import — available in py-tgcalls >= 2.1.
+# We guard with try/except to keep backward compat with 2.0.x.
+# ---------------------------------------------------------------------------
+try:
+    from pytgcalls.types import ChatUpdate as _ChatUpdate  # type: ignore[attr-defined]
+    _CHAT_UPDATE_CLS = _ChatUpdate
+    _LEFT_CALL_STATUS = _ChatUpdate.Status.LEFT_CALL  # type: ignore[attr-defined]
+    _HAS_CHAT_UPDATE = True
+except (ImportError, AttributeError):
+    _CHAT_UPDATE_CLS = None  # type: ignore[assignment]
+    _LEFT_CALL_STATUS = None
+    _HAS_CHAT_UPDATE = False
+
+# ---------------------------------------------------------------------------
+# Stream-end type: StreamEnded (>= 2.1) or StreamAudioEnded (2.0.x).
+# ---------------------------------------------------------------------------
+_STREAM_ENDED_CLS: Optional[type] = None
+try:
+    from pytgcalls.types.stream import StreamEnded as _SE  # type: ignore[attr-defined]
+    _STREAM_ENDED_CLS = _SE
+except ImportError:
+    pass
+
+if _STREAM_ENDED_CLS is None:
+    try:
+        from pytgcalls.types.stream import StreamAudioEnded as _SAE  # type: ignore[attr-defined]
+        _STREAM_ENDED_CLS = _SAE
+    except ImportError:
+        pass
+
+# If we still have nothing, fall back to the generic Update base so that
+# the isinstance check below always passes (stream events will still fire).
+if _STREAM_ENDED_CLS is None:
+    _STREAM_ENDED_CLS = Update  # type: ignore[assignment]
 
 from app.core.logger import logger
 
@@ -198,10 +249,40 @@ class VoiceChatManager:
             logger.debug("leave_call suppressed  chat_id={}  error={}", chat_id, exc)
 
     def _register_callbacks(self) -> None:
-        """Attach py-tgcalls event handlers (must be called before start())."""
+        """
+        Attach py-tgcalls event handlers (must be called before start()).
 
-        @self._tgcalls.on_stream_end()
-        async def _on_stream_end(_client: PyTgCalls, update: Update) -> None:
+        py-tgcalls >= 2.1 replaced the legacy per-event decorators
+        (on_stream_end, on_kicked, on_closed_voice_chat) with a unified
+        on_update() dispatcher.  We try to register with the new API first
+        and fall back to the old one so the same code works on every 2.x
+        release.
+        """
+        registered = self._try_register_new_api()
+        if not registered:
+            self._register_legacy_api()
+
+    # ── New API (py-tgcalls >= 2.1) ───────────────────────────────────────────
+
+    def _try_register_new_api(self) -> bool:
+        """
+        Register handlers using the on_update() API introduced in py-tgcalls 2.1.
+
+        Returns True when registration succeeded, False when the API is not
+        present (older version — caller should fall back to legacy API).
+        """
+        if not hasattr(self._tgcalls, "on_update"):
+            return False
+
+        # ── Stream-end handler ────────────────────────────────────────────
+        @self._tgcalls.on_update()
+        async def _on_stream_end_new(_client: PyTgCalls, update: Update) -> None:
+            # Skip chat-level updates (kicked / VC closed) — handled below.
+            if _CHAT_UPDATE_CLS is not None and isinstance(update, _CHAT_UPDATE_CLS):
+                return
+            # Accept only stream-end events.
+            if not isinstance(update, _STREAM_ENDED_CLS):
+                return
             chat_id: int = update.chat_id
             logger.info("Stream ended naturally  chat_id={}", chat_id)
             self._active.discard(chat_id)
@@ -214,16 +295,98 @@ class VoiceChatManager:
                         chat_id, exc,
                     )
 
-        @self._tgcalls.on_kicked()
-        async def _on_kicked(_client: PyTgCalls, update: Update) -> None:
+        # ── Chat-update handler (kicked / VC closed / bot left) ───────────
+        if _HAS_CHAT_UPDATE and _LEFT_CALL_STATUS is not None:
+            try:
+                @self._tgcalls.on_update(fl.chat_update(_LEFT_CALL_STATUS))
+                async def _on_left_new(_client: PyTgCalls, update: Update) -> None:
+                    chat_id: int = update.chat_id
+                    logger.warning(
+                        "Bot left/kicked/VC-closed  chat_id={}", chat_id
+                    )
+                    self._active.discard(chat_id)
+                    if self._on_stream_end is not None:
+                        try:
+                            await self._on_stream_end(chat_id)
+                        except Exception as exc:
+                            logger.error(
+                                "on_left callback raised  chat_id={}  error={}",
+                                chat_id, exc,
+                            )
+            except Exception as exc:
+                logger.debug(
+                    "Could not register chat_update filter handler: {}", exc
+                )
+        else:
+            # Fallback: catch all updates and filter by type at runtime.
+            @self._tgcalls.on_update()
+            async def _on_left_fallback(
+                _client: PyTgCalls, update: Update
+            ) -> None:
+                if _CHAT_UPDATE_CLS is None:
+                    return
+                if not isinstance(update, _CHAT_UPDATE_CLS):
+                    return
+                chat_id: int = update.chat_id
+                logger.warning(
+                    "Bot left/kicked/VC-closed (fallback)  chat_id={}", chat_id
+                )
+                self._active.discard(chat_id)
+                if self._on_stream_end is not None:
+                    try:
+                        await self._on_stream_end(chat_id)
+                    except Exception as exc:
+                        logger.error(
+                            "on_left_fallback raised  chat_id={}  error={}",
+                            chat_id, exc,
+                        )
+
+        logger.debug("PyTgCalls handlers registered via new on_update() API")
+        return True
+
+    # ── Legacy API (py-tgcalls 2.0.x) ────────────────────────────────────────
+
+    def _register_legacy_api(self) -> None:
+        """
+        Register handlers using the legacy decorator methods present in
+        py-tgcalls 2.0.x (on_stream_end, on_kicked, on_closed_voice_chat).
+
+        This path is only reached when on_update() is absent.
+        """
+        logger.debug(
+            "on_update() not found — falling back to legacy PyTgCalls API"
+        )
+
+        @self._tgcalls.on_stream_end()  # type: ignore[attr-defined]
+        async def _on_stream_end_legacy(
+            _client: PyTgCalls, update: Update
+        ) -> None:
+            chat_id: int = update.chat_id
+            logger.info("Stream ended naturally  chat_id={}", chat_id)
+            self._active.discard(chat_id)
+            if self._on_stream_end is not None:
+                try:
+                    await self._on_stream_end(chat_id)
+                except Exception as exc:
+                    logger.error(
+                        "on_stream_end callback raised  chat_id={}  error={}",
+                        chat_id, exc,
+                    )
+
+        @self._tgcalls.on_kicked()  # type: ignore[attr-defined]
+        async def _on_kicked_legacy(
+            _client: PyTgCalls, update: Update
+        ) -> None:
             chat_id = update.chat_id
             logger.warning("Bot kicked from VC  chat_id={}", chat_id)
             self._active.discard(chat_id)
             if self._on_stream_end is not None:
                 await self._on_stream_end(chat_id)
 
-        @self._tgcalls.on_closed_voice_chat()
-        async def _on_closed(_client: PyTgCalls, update: Update) -> None:
+        @self._tgcalls.on_closed_voice_chat()  # type: ignore[attr-defined]
+        async def _on_closed_legacy(
+            _client: PyTgCalls, update: Update
+        ) -> None:
             chat_id = update.chat_id
             logger.warning("Voice chat closed  chat_id={}", chat_id)
             self._active.discard(chat_id)
