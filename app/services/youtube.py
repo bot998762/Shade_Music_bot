@@ -102,12 +102,19 @@ _BASE_OPTS: Dict = {
 }
 
 # ── Search-specific options ───────────────────────────────────────────────────
-# We only need metadata during search — no format selector is needed because
-# we never play back the result directly.  Adding a format selector here would
-# cause yt-dlp to validate format availability and *fail* with the same
-# "Requested format is not available" error before we even try to stream.
+# KEY: extract_flat="in_playlist" prevents yt-dlp from doing per-entry format
+# resolution during search.  Without this, yt-dlp validates which audio/video
+# renditions the video exposes, and for any video with an unusual codec
+# (e.g. iamf.001.001.Opus, AV1-only, DRC formats) it raises
+# "Requested format is not available" before returning any metadata at all.
+#
+# With extract_flat="in_playlist" yt-dlp returns the entry's title, id, url,
+# duration, uploader and thumbnail directly from the YouTube search API
+# response — no codec or format negotiation is attempted.  We resolve the
+# actual stream URL separately, just before playback, via _sync_get_stream_url.
 _SEARCH_OPTS: Dict = {
     **_BASE_OPTS,
+    "extract_flat": "in_playlist",  # metadata-only; overrides _BASE_OPTS False
     "default_search": "ytsearch",
     "skip_download": True,
 }
@@ -228,24 +235,58 @@ class YouTubeService:
                 return None
 
             entry = entries[0]
+
+            # ── webpage_url ───────────────────────────────────────────────
+            # With extract_flat="in_playlist" the entry's "url" field holds
+            # the watch URL (https://www.youtube.com/watch?v=ID).
+            # "webpage_url" is only present on fully-extracted entries.
+            # We fall back to constructing it from the video ID when both
+            # fields are absent (should never happen for YouTube, but safe).
+            video_id: str = entry.get("id") or ""
+            webpage_url: str = (
+                entry.get("webpage_url")
+                or entry.get("url")
+                or (f"https://www.youtube.com/watch?v={video_id}" if video_id else "")
+            )
+            if not webpage_url:
+                logger.warning(
+                    "YouTube search: could not determine webpage_url for '{}'", query
+                )
+                return None
+
+            # ── thumbnail ─────────────────────────────────────────────────
+            # Flat entries may carry a single "thumbnail" string or a
+            # "thumbnails" list [{url, width, height}, ...].  We prefer the
+            # highest-resolution thumbnail (last item in the sorted list).
+            thumbnail: Optional[str] = entry.get("thumbnail")
+            if thumbnail is None:
+                thumbs: list = entry.get("thumbnails") or []
+                if thumbs:
+                    thumbnail = thumbs[-1].get("url")
+
+            # ── uploader ──────────────────────────────────────────────────
+            uploader: str = (
+                entry.get("uploader")
+                or entry.get("channel")
+                or entry.get("uploader_id")
+                or "Unknown"
+            )
+
             track = Track(
                 title=entry.get("title") or "Unknown Title",
                 duration=int(entry.get("duration") or 0),
-                webpage_url=entry.get("webpage_url") or entry.get("url", ""),
-                uploader=(
-                    entry.get("uploader")
-                    or entry.get("channel")
-                    or "Unknown"
-                ),
-                thumbnail=entry.get("thumbnail"),
+                webpage_url=webpage_url,
+                uploader=uploader,
+                thumbnail=thumbnail,
                 requested_by_id=requested_by_id,
                 requested_by_name=requested_by_name,
             )
             logger.info(
-                "YouTube search OK: query='{}' → title='{}' duration={}s",
+                "YouTube search OK: query='{}' → title='{}' duration={}s url='{}'",
                 query,
                 track.title,
                 track.duration,
+                webpage_url,
             )
             return track
 
