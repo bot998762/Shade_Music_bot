@@ -29,7 +29,8 @@ import time
 from typing import Dict
 
 from pyrogram import Client, filters
-from pyrogram.types import ChatMemberOwner, ChatMemberAdministrator, Message
+from pyrogram.types import Message
+from pyrogram.enums import ChatMemberStatus
 
 from app.core.logger import logger
 from app.player.engine import MusicEngine, format_now_playing
@@ -68,7 +69,7 @@ async def _is_admin_or_owner(
         return True
     try:
         member = await client.get_chat_member(chat_id, user_id)
-        return isinstance(member, (ChatMemberOwner, ChatMemberAdministrator))
+        return member.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
     except Exception as exc:
         logger.debug(
             "Admin check failed chat={} user={} — defaulting to allow: {}",
