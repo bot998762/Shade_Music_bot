@@ -12,20 +12,15 @@ services:
     dockerfilePath: ./Dockerfile
     dockerContext: .
 
-    # Render's free/starter plan — upgrade as traffic grows
     plan: starter
-
-    # Render sets $PORT automatically; our app reads it via Settings
-    # No need to hard-code the port here.
 
     healthCheckPath: /health
 
-    # Auto-deploy when commits are pushed to the main branch
     autoDeploy: true
 
     # ── Environment Variables ──────────────────────────────────────────────────
-    # Mark each as sync: false so Render stores them as secrets in the dashboard
-    # rather than committing values to this file.
+    # Mark sensitive values as sync: false so Render stores them as secrets
+    # in the dashboard rather than committing values to this file.
     envVars:
       - key: API_ID
         sync: false
@@ -45,6 +40,32 @@ services:
       - key: MONGO_DB_NAME
         value: shademusicbot
 
+      # ── REQUIRED for voice chat audio ─────────────────────────────────────
+      # A Pyrogram string session for a USER account (the "assistant") that
+      # joins voice chats and streams audio.  A bot account CANNOT produce
+      # audio in Telegram voice chats — you must use a real user account.
+      #
+      # Generate with:
+      #   python -c "
+      #   import asyncio
+      #   from pyrogram import Client
+      #   async def main():
+      #       async with Client('gen', api_id=YOUR_API_ID, api_hash='YOUR_API_HASH') as c:
+      #           print(await c.export_session_string())
+      #   asyncio.run(main())
+      #   "
+      #
+      # Set this in the Render dashboard under Environment → Secret Files / Vars.
+      # Without this, no audio will play.
+      - key: ASSISTANT_SESSION
+        sync: false
+
+      # ── Optional: YouTube cookies for age-restricted / region-locked videos ─
+      # Path to a Netscape-format cookies.txt exported from your browser.
+      # Leave empty if not needed — the bot works for public videos without it.
+      - key: COOKIES_PATH
+        value: ""
+
       - key: LOG_LEVEL
         value: INFO
 
@@ -54,5 +75,6 @@ services:
       - key: DEFAULT_VOLUME
         value: "100"
 
+      # Comma-separated list of extra admin Telegram user IDs (optional)
       - key: SUDO_USERS
         value: ""

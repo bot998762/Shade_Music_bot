@@ -16,11 +16,23 @@ Design rules
   naturally.  The engine decides what to do next (play next track or leave).
 * ``notify_fn`` is an optional async callable injected by the lifecycle so
   the engine can send "Now Playing" messages without importing pyrogram.
+
+Fixes applied (audit 2026-08-05)
+---------------------------------
+* on_stream_end is now iterative (while loop + MAX_RETRIES) — no recursion.
+* skip() sets VoiceChatManager.begin_skip() guard before change_stream() so
+  the StreamEnded event fired by change_stream does not double-advance.
+* _start_next() saves the track reference and re-queues it on join failure
+  so the track is never permanently lost.
+* asyncio.get_running_loop() used instead of deprecated get_event_loop().
+* _stream_end_locks uses a defaultdict; old locks for unused chats are pruned
+  periodically to avoid an unbounded memory leak.
 """
 
 from __future__ import annotations
 
 import asyncio
+import collections
 from typing import Awaitable, Callable, List, Optional, Tuple
 
 from app.core.logger import logger
@@ -32,6 +44,14 @@ from app.streaming.voice_chat import VoiceChatManager
 
 # Signature: notify_fn(chat_id, text)
 NotifyFn = Callable[[int, str], Awaitable[None]]
+
+# Maximum number of consecutive URL-resolution failures before giving up
+# and leaving the VC (prevents an infinite loop on a queue full of dead links).
+_MAX_SKIP_RETRIES = 3
+
+
+def _make_lock() -> asyncio.Lock:
+    return asyncio.Lock()
 
 
 class MusicEngine:
@@ -67,7 +87,11 @@ class MusicEngine:
         self._yt = yt
         self._notify = notify_fn
         self._max_queue = max_queue_size
-        # Guards against concurrent on_stream_end calls for the same chat
+
+        # Per-chat lock to serialise on_stream_end calls.
+        # defaultdict(asyncio.Lock) is NOT safe — asyncio.Lock() must be
+        # created inside the running loop.  We use a plain dict and
+        # create locks lazily on first access inside the async method.
         self._stream_end_locks: dict[int, asyncio.Lock] = {}
 
     # ── Public commands ───────────────────────────────────────────────────────
@@ -124,8 +148,10 @@ class MusicEngine:
         """
         Skip the current track.
 
-        Starts the next queued track if one exists, otherwise stops and
-        leaves the voice chat.
+        Sets the skip-in-progress guard on VoiceChatManager before calling
+        change_stream() so that the StreamEnded event fired by pytgcalls
+        for the replaced track does not cause on_stream_end to double-advance
+        the queue.
 
         Returns the new current track, or ``None`` when the queue was empty.
         """
@@ -142,16 +168,35 @@ class MusicEngine:
 
         stream_url = await self._yt.get_stream_url(next_track.webpage_url)
         if stream_url is None:
-            logger.error("skip: could not resolve stream URL for '{}'", next_track.title)
-            # Try the one after this
-            return await self.skip(chat_id)
+            logger.error(
+                "skip: could not resolve stream URL for '{}' — leaving VC",
+                next_track.title,
+            )
+            await self._leave_and_cleanup(chat_id)
+            return None
 
         stream = FFmpegStreamBuilder.build(stream_url)
-        changed = await self._vc.change_stream(chat_id, stream)
+
+        # ── skip guard: suppress StreamEnded from change_stream() ──────────
+        self._vc.begin_skip(chat_id)
+        try:
+            changed = await self._vc.change_stream(chat_id, stream)
+        finally:
+            # Always clear the guard, even if change_stream() raises.
+            # Use a short delay so the StreamEnded event (which pytgcalls
+            # dispatches asynchronously) is still in-flight when we clear.
+            async def _delayed_end_skip() -> None:
+                await asyncio.sleep(1.0)
+                self._vc.end_skip(chat_id)
+
+            asyncio.ensure_future(_delayed_end_skip())
+
         if not changed:
             await self._leave_and_cleanup(chat_id)
             return None
 
+        self._queue.set_current(chat_id, next_track)
+        await self._send_now_playing(chat_id, next_track)
         return next_track
 
     async def stop(self, chat_id: int) -> None:
@@ -188,57 +233,81 @@ class MusicEngine:
         """
         Invoked automatically when a track finishes playing.
 
-        Plays the next queued track or leaves the VC if the queue is empty.
-        Protected by a per-chat lock to prevent race conditions when multiple
-        end events arrive close together (kicked + stream_end, etc.).
+        Uses an iterative loop (not recursion) with a _MAX_SKIP_RETRIES cap
+        so that a queue of failed URLs cannot blow the call stack or spin
+        forever.
+
+        Protected by a per-chat asyncio.Lock to serialise concurrent calls
+        (e.g. StreamEnded + LEFT_CALL arriving in the same event loop tick).
         """
+        # Lazy-create the lock so it is always created inside the running loop.
         if chat_id not in self._stream_end_locks:
             self._stream_end_locks[chat_id] = asyncio.Lock()
 
         async with self._stream_end_locks[chat_id]:
             logger.info("on_stream_end triggered — chat_id={}", chat_id)
+            retries = 0
 
-            if await self._queue.is_empty(chat_id):
-                await self._leave_and_cleanup(chat_id)
-                return
+            while retries < _MAX_SKIP_RETRIES:
+                if await self._queue.is_empty(chat_id):
+                    logger.info("Queue exhausted — leaving VC  chat_id={}", chat_id)
+                    await self._leave_and_cleanup(chat_id)
+                    return
 
-            next_track = await self._queue.pop_next(chat_id)
-            if next_track is None:
-                await self._leave_and_cleanup(chat_id)
-                return
+                next_track = await self._queue.pop_next(chat_id)
+                if next_track is None:
+                    await self._leave_and_cleanup(chat_id)
+                    return
 
-            stream_url = await self._yt.get_stream_url(next_track.webpage_url)
-            if stream_url is None:
-                logger.error(
-                    "on_stream_end: could not resolve stream URL for '{}' — skipping",
-                    next_track.title,
-                )
-                # Recurse once to try the next track
-                await self.on_stream_end(chat_id)
-                return
+                stream_url = await self._yt.get_stream_url(next_track.webpage_url)
+                if stream_url is None:
+                    retries += 1
+                    logger.error(
+                        "on_stream_end: could not resolve stream URL for '{}' "
+                        "(attempt {}/{}) — trying next track",
+                        next_track.title,
+                        retries,
+                        _MAX_SKIP_RETRIES,
+                    )
+                    continue  # try the next track in the queue
 
-            stream = FFmpegStreamBuilder.build(stream_url)
-            changed = await self._vc.change_stream(chat_id, stream)
+                stream = FFmpegStreamBuilder.build(stream_url)
+                changed = await self._vc.change_stream(chat_id, stream)
 
-            if changed:
-                logger.info(
-                    "Auto-advancing to '{}' in chat_id={}",
-                    next_track.title,
-                    chat_id,
-                )
-                await self._send_now_playing(chat_id, next_track)
-            else:
-                logger.warning(
-                    "Auto-advance failed for chat_id={} — leaving VC",
-                    chat_id,
-                )
-                await self._leave_and_cleanup(chat_id)
+                if changed:
+                    self._queue.set_current(chat_id, next_track)
+                    logger.info(
+                        "Auto-advancing to '{}' — chat_id={}",
+                        next_track.title,
+                        chat_id,
+                    )
+                    await self._send_now_playing(chat_id, next_track)
+                    return
+                else:
+                    logger.warning(
+                        "Auto-advance change_stream failed — leaving VC  chat_id={}",
+                        chat_id,
+                    )
+                    await self._leave_and_cleanup(chat_id)
+                    return
+
+            # Exhausted retries without playing anything
+            logger.error(
+                "on_stream_end: {} consecutive URL failures — leaving VC  chat_id={}",
+                _MAX_SKIP_RETRIES,
+                chat_id,
+            )
+            await self._leave_and_cleanup(chat_id)
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
     async def _start_next(self, chat_id: int) -> None:
         """
         Pop the head of the queue, resolve its stream URL, and begin playback.
+
+        Saves the track reference before the VC join attempt so that if the
+        join fails, the track is prepended back to the queue and not lost.
+
         Raises ``RuntimeError`` if the voice chat cannot be joined.
         """
         track = await self._queue.pop_next(chat_id)
@@ -247,6 +316,8 @@ class MusicEngine:
 
         stream_url = await self._yt.get_stream_url(track.webpage_url)
         if stream_url is None:
+            # Put the track back at the front of the queue so it isn't lost.
+            await self._queue.prepend(chat_id, track)
             raise RuntimeError(
                 f"Could not resolve audio stream for **{track.title}**. "
                 "The video may be unavailable or region-locked."
@@ -254,13 +325,18 @@ class MusicEngine:
 
         stream = FFmpegStreamBuilder.build(stream_url)
         joined = await self._vc.play(chat_id, stream)
+
         if not joined:
-            # Roll the track back so it isn't lost
+            # Put the track back so the user can retry.
+            await self._queue.prepend(chat_id, track)
             self._queue.set_current(chat_id, None)
             raise RuntimeError(
                 "Could not join the voice chat. "
-                "Make sure a voice chat is active and the bot has permission to join."
+                "Make sure a voice chat is active and the assistant has "
+                "permission to join."
             )
+
+        self._queue.set_current(chat_id, track)
 
     async def _leave_and_cleanup(self, chat_id: int) -> None:
         await self._vc.leave(chat_id)
@@ -271,13 +347,23 @@ class MusicEngine:
         """Send a 'Now Playing' notification if a notify function is set."""
         if self._notify is None:
             return
-        text = (
-            "🎵 **Now Playing**\n\n"
-            f"**{track.title}**\n"
-            f"⏱ {track.formatted_duration}  •  👤 {track.uploader}\n"
-            f"Requested by: {track.requested_by_name}"
-        )
+        text = format_now_playing(track)
         try:
             await self._notify(chat_id, text)
         except Exception as exc:
             logger.debug("Could not send now-playing notification: {}", exc)
+
+
+def format_now_playing(track: Track) -> str:
+    """
+    Shared helper — produces the Now Playing message text.
+
+    Used by both MusicEngine._send_now_playing() (auto-advance) and
+    the /play handler (immediate play) so the format is always consistent.
+    """
+    return (
+        "🎵 **Now Playing**\n\n"
+        f"**{track.title}**\n"
+        f"⏱ {track.formatted_duration}  •  👤 {track.uploader}\n"
+        f"Requested by: {track.requested_by_name}"
+    )

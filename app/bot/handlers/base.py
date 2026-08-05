@@ -53,8 +53,9 @@ def register(client: Client, db: DatabaseManager) -> None:
         await msg.reply_text(
             "🎵 **ShadeMusicBot**\n\n"
             "Hello! I'm your high-quality Telegram Voice Chat music bot.\n\n"
-            "Use /help to see available commands.\n\n"
-            "_Phase 0 — Foundation_",
+            "Use /help to see all commands, or type `/play <song name>` "
+            "in a group with an active voice chat to start listening!\n\n"
+            "_Phase 1 — Music Engine_",
             quote=True,
         )
 
@@ -63,12 +64,20 @@ def register(client: Client, db: DatabaseManager) -> None:
     async def cmd_help(c: Client, msg: Message) -> None:
         await msg.reply_text(
             "🎵 **ShadeMusicBot — Commands**\n\n"
+            "**Music (use in a group with active voice chat)**\n"
+            "• `/play <song or URL>` — Search YouTube and play\n"
+            "• `/skip`   — Skip to the next track _(admins only)_\n"
+            "• `/stop`   — Stop playback and clear queue _(admins only)_\n"
+            "• `/pause`  — Pause the current track\n"
+            "• `/resume` — Resume a paused track\n"
+            "• `/queue`  — Show the current queue\n\n"
             "**General**\n"
             "• /start — Start the bot\n"
             "• /help  — Show this message\n"
             "• /ping  — Check latency\n"
             "• /info  — Show bot info\n\n"
-            "_More commands will be added in upcoming phases._",
+            "💡 **Tip:** Make sure a voice chat is already open in the group "
+            "before using /play.",
             quote=True,
         )
 
@@ -101,7 +110,7 @@ def register(client: Client, db: DatabaseManager) -> None:
             f"• **Name:** {me.first_name}\n"
             f"• **Username:** @{me.username}\n"
             f"• **ID:** `{me.id}`\n"
-            f"• **Phase:** `0 — Foundation`\n"
+            f"• **Phase:** `1 — Music Engine`\n"
             f"• **Time:** `{now_utc}`\n"
         )
         await msg.reply_text(text, quote=True)

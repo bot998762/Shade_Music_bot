@@ -3,31 +3,55 @@ app.streaming.ffmpeg
 ~~~~~~~~~~~~~~~~~~~~
 Centralised factory for pytgcalls MediaStream objects.
 
-py-tgcalls 2.x API — verified against:
-  • Official example: pytgcalls/pytgcalls/example/piped_audio_calls/example_piped_audio.py
-  • Official example: pytgcalls/pytgcalls/example/remote_piped_play/example_remote_piped.py
+py-tgcalls 2.3+ API — verified against:
+  • pytgcalls/pytgcalls master (2025-08-05)
+  • AsmSafone/MusicPlayer main.py (production reference)
+  • Official examples: piped_audio_calls, remote_piped_play
 
-Confirmed API surface (py-tgcalls >= 2.0.0):
-  from pytgcalls.types import MediaStream, AudioQuality
+Confirmed API surface (py-tgcalls >= 2.3.0):
+  from pytgcalls.types import MediaStream, AudioQuality, AudioParameters
 
-  MediaStream(path)                                      # a/v, default quality
-  MediaStream(path, AudioQuality.HIGH, VideoQuality.X)   # positional args
-  MediaStream(path, video_flags=MediaStream.Flags.IGNORE) # audio-only
+  MediaStream(
+      media_path,
+      audio_parameters=AudioParameters(),   # keyword, not positional
+      video_flags=MediaStream.Flags.IGNORE, # audio-only
+      ffmpeg_parameters="...",              # extra FFmpeg CLI args
+  )
 
-BREAKING CHANGE vs older drafts:
+  AudioQuality is a convenience enum whose values ARE AudioParameters instances:
+      AudioQuality.HIGH   == AudioParameters(bitrate=128000, channels=2)
+      AudioQuality.STUDIO == AudioParameters(bitrate=320000, channels=2)
+
+Breaking changes vs older code:
+  WRONG (positional, unreliable across 2.x minor versions):
+      MediaStream(url, AudioQuality.HIGH, video_flags=...)
+  CORRECT (keyword, stable):
+      MediaStream(url, audio_parameters=AudioQuality.HIGH, video_flags=...)
+
   WRONG:  video_flags=MediaStream.IGNORE
-  RIGHT:  video_flags=MediaStream.Flags.IGNORE
-  Source: piped_audio_calls/example_piped_audio.py (master branch, 2025-08-05)
+  CORRECT: video_flags=MediaStream.Flags.IGNORE
 """
 
 from __future__ import annotations
 
 from pytgcalls.types import AudioQuality, MediaStream
 
+# FFmpeg flags that improve stability when streaming from remote HTTPS URLs
+# (YouTube DASH segments on googlevideo.com):
+#   -reconnect 1               — reconnect on disconnect
+#   -reconnect_streamed 1      — reconnect even for streamed sources
+#   -reconnect_delay_max 5     — give up after 5 s without reconnect
+#   -vn                        — discard video track at FFmpeg level (belt+suspenders)
+_FFMPEG_RECONNECT = (
+    "-reconnect 1 "
+    "-reconnect_streamed 1 "
+    "-reconnect_delay_max 5"
+)
+
 
 class FFmpegStreamBuilder:
     """
-    Builds MediaStream objects for py-tgcalls 2.x.
+    Builds MediaStream objects for py-tgcalls 2.3+.
 
     Usage
     -----
@@ -47,23 +71,25 @@ class FFmpegStreamBuilder:
         Parameters
         ----------
         stream_url:
-            Direct audio URL returned by YouTubeService.
+            Direct audio URL returned by YouTubeService (HTTPS).
         quality:
             AudioQuality.LOW | .MEDIUM | .HIGH | .STUDIO
-            Defaults to HIGH for good quality without excessive bandwidth.
+            Defaults to HIGH (128 kbps, stereo).
 
         Notes
         -----
-        AudioQuality is passed as the second positional argument (matching
-        the official py-tgcalls examples).
+        audio_parameters is passed as a keyword argument — required for
+        compatibility across all py-tgcalls 2.x minor versions.
 
-        video_flags=MediaStream.Flags.IGNORE tells py-tgcalls that no video
-        track will ever arrive, so it does not hold the call open waiting for
-        one.  Using the old MediaStream.IGNORE (without .Flags) raises
-        AttributeError at runtime.
+        video_flags=MediaStream.Flags.IGNORE tells ntgcalls not to wait for
+        a video track, preventing the call from stalling on audio-only URLs.
+
+        ffmpeg_parameters adds reconnect flags so a brief CDN hiccup (common
+        with googlevideo.com on Render) does not permanently drop the stream.
         """
         return MediaStream(
             stream_url,
-            quality,                       # positional — AudioQuality enum
-            video_flags=MediaStream.Flags.IGNORE,  # audio-only stream
+            audio_parameters=quality,                  # keyword — stable across 2.x
+            video_flags=MediaStream.Flags.IGNORE,      # audio-only stream
+            ffmpeg_parameters=_FFMPEG_RECONNECT,       # resilience on remote URLs
         )

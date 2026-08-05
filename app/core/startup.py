@@ -7,11 +7,21 @@ Phase 1 init order
 ------------------
 1. Database  (MongoDB Atlas)
 2. Bot client (Pyrogram bot)
-3. Assistant client (Pyrogram user — optional)
+3. Assistant client (Pyrogram user — optional but strongly recommended)
 4. Voice-chat manager (PyTgCalls)
 5. Music engine (orchestrator)
 6. Music handlers  (registered onto bot client)
 7. OS signals
+
+Fixes applied (audit 2026-08-05)
+---------------------------------
+* asyncio.get_running_loop() replaces deprecated get_event_loop() in
+  _register_signals().
+* YouTubeService.shutdown() called in stop() so the executor is cleanly
+  drained on process exit.
+* owner_id passed to register_music_handlers so admin guard works.
+* Phase label updated to Phase 1.
+* WARNING log clearly explains consequences of missing ASSISTANT_SESSION.
 """
 
 from __future__ import annotations
@@ -46,6 +56,7 @@ class ApplicationLifecycle:
         self._bot: Optional[BotClient] = None
         self._assistant: Optional[Client] = None
         self._shutdown_event = asyncio.Event()
+        self._yt_service = None   # kept for shutdown
 
         # Phase 1 sub-systems (imported lazily to keep Phase 0 import-clean)
         self._vc_manager = None
@@ -55,7 +66,7 @@ class ApplicationLifecycle:
 
     async def start(self) -> None:
         logger.info("=" * 60)
-        logger.info("  ShadeMusicBot -- starting up")
+        logger.info("  ShadeMusicBot v1.0 — Phase 1 (Music Engine)")
         logger.info("=" * 60)
 
         await self._init_database()
@@ -68,7 +79,7 @@ class ApplicationLifecycle:
         logger.info("=" * 60)
 
     async def stop(self) -> None:
-        logger.info("Shutdown signal received -- stopping gracefully...")
+        logger.info("Shutdown signal received — stopping gracefully...")
 
         if self._vc_manager is not None:
             await self._vc_manager.stop()
@@ -88,6 +99,10 @@ class ApplicationLifecycle:
         if self._db is not None:
             await self._db.disconnect()
             logger.info("Database disconnected")
+
+        # Shut down the yt-dlp executor so its threads are released cleanly.
+        if self._yt_service is not None:
+            self._yt_service.shutdown()
 
         logger.info("Shutdown complete. Goodbye.")
 
@@ -113,7 +128,7 @@ class ApplicationLifecycle:
         await self._db.ping()
         await self._db.ensure_indexes()
         logger.info(
-            "MongoDB connected -- database='{}'",
+            "MongoDB connected — database='{}'",
             self._settings.mongo_db_name,
         )
 
@@ -123,7 +138,7 @@ class ApplicationLifecycle:
         await self._bot.start()
         me = await self._bot.get_me()
         logger.info(
-            "Bot client ready -- @{username} (id={id})",
+            "Bot client ready — @{username} (id={id})",
             username=me.username,
             id=me.id,
         )
@@ -138,9 +153,11 @@ class ApplicationLifecycle:
         from app.player.engine import MusicEngine
         from app.services.youtube import YouTubeService
         from app.streaming.voice_chat import VoiceChatManager
+        from app.bot import handlers as music_handlers
 
         # ── YouTube service ────────────────────────────────────────────────
         yt_service = YouTubeService(cookies_path=self._settings.cookies_path)
+        self._yt_service = yt_service  # store reference for shutdown
         logger.info("YouTube service initialised")
 
         # ── Voice-chat client (user assistant or bot fallback) ─────────────
@@ -174,7 +191,11 @@ class ApplicationLifecycle:
         await vc_manager.start()
 
         # ── Register music command handlers ────────────────────────────────
-        self._bot.register_music_handlers(engine)  # type: ignore[union-attr]
+        # Pass owner_id so the admin guard on /skip and /stop works.
+        self._bot.register_music_handlers(  # type: ignore[union-attr]
+            engine,
+            owner_id=self._settings.owner_id,
+        )
 
         # Keep references for clean shutdown
         self._vc_manager = vc_manager
@@ -187,8 +208,13 @@ class ApplicationLifecycle:
         Return the Pyrogram client that PyTgCalls will use to join VCs.
 
         Priority:
-          1. ASSISTANT_SESSION string -> user client (recommended)
-          2. Bot client itself (requires vc-admin permission in the group)
+          1. ASSISTANT_SESSION string -> user client (strongly recommended)
+          2. Bot client itself (only works with 'Manage Voice Chats' admin perm)
+
+        IMPORTANT: A bot account cannot produce audio in Telegram group voice
+        chats without explicit admin-level "Manage Voice Chats" permission.
+        Even with that permission, some Telegram server versions reject audio
+        from bot accounts entirely.  ALWAYS set ASSISTANT_SESSION.
         """
         session = self._settings.assistant_session
 
@@ -204,7 +230,7 @@ class ApplicationLifecycle:
             await assistant.start()
             me = await assistant.get_me()
             logger.info(
-                "Assistant client ready -- {} (id={})",
+                "Assistant client ready — {} (id={})",
                 me.first_name,
                 me.id,
             )
@@ -212,15 +238,26 @@ class ApplicationLifecycle:
             return assistant
 
         logger.warning(
-            "ASSISTANT_SESSION not set -- using bot client for voice chats. "
-            "The bot must have 'Manage Voice Chats' admin permission in the group."
+            "╔══════════════════════════════════════════════════════════╗\n"
+            "║  ASSISTANT_SESSION is NOT set.                          ║\n"
+            "║                                                          ║\n"
+            "║  The bot will attempt to join voice chats using its own  ║\n"
+            "║  bot account.  This WILL NOT produce audio in most       ║\n"
+            "║  groups — Telegram requires a real user account to       ║\n"
+            "║  stream audio into voice chats.                          ║\n"
+            "║                                                          ║\n"
+            "║  Set ASSISTANT_SESSION in your Render environment to     ║\n"
+            "║  fix this.  See render.yaml for generation instructions. ║\n"
+            "╚══════════════════════════════════════════════════════════╝"
         )
         return self._bot.client  # type: ignore[union-attr]
 
     # ── OS signal registration ────────────────────────────────────────────────
 
     def _register_signals(self) -> None:
-        loop = asyncio.get_event_loop()
+        # get_running_loop() is correct inside a running coroutine.
+        # get_event_loop() is deprecated for this use in Python 3.10+.
+        loop = asyncio.get_running_loop()
 
         def _handle(sig: signal.Signals) -> None:
             logger.info("Received signal {}", sig.name)

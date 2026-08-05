@@ -36,7 +36,7 @@ async def run() -> None:
 
     # ── 2. Logging ────────────────────────────────────────────────────────────
     setup_logging(settings.log_level)
-    logger.info("ShadeMusicBot v0.1.0 — Phase 0 (Foundation)")
+    logger.info("ShadeMusicBot v1.0.0 — Phase 1 (Music Engine)")
     logger.info("Python {}", sys.version.split()[0])
 
     # ── 3. Lifecycle ──────────────────────────────────────────────────────────

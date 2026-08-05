@@ -11,19 +11,86 @@ Every handler follows the same pattern:
   5. Catch every exception and report it to the user without crashing.
 
 These handlers are intentionally thin — no business logic lives here.
+
+Fixes applied (audit 2026-08-05)
+---------------------------------
+* format_now_playing() shared helper used for Now Playing text — consistent
+  format between immediate play and auto-advance notifications.
+* Per-user rate limiting on /play (3-second cooldown) to prevent executor
+  saturation from rapid-fire requests.
+* Admin/owner check on /skip and /stop — any group admin or the bot owner
+  can control playback; regular users cannot.
+* /help updated to include all Phase 1 music commands.
 """
 
 from __future__ import annotations
 
+import time
+from typing import Dict
+
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import ChatMemberOwner, ChatMemberAdministrator, Message
 
 from app.core.logger import logger
-from app.player.engine import MusicEngine
+from app.player.engine import MusicEngine, format_now_playing
+
+# ── Rate limiting ─────────────────────────────────────────────────────────────
+# Maps user_id → unix timestamp of last /play invocation.
+# Module-level dict is safe for a single-process bot.
+_PLAY_LAST_CALL: Dict[int, float] = {}
+_PLAY_COOLDOWN_SEC = 3.0
 
 
-def register(client: Client, engine: MusicEngine) -> None:
-    """Attach all music handlers to *client*."""
+def _is_rate_limited(user_id: int) -> bool:
+    """Return True when the user called /play less than _PLAY_COOLDOWN_SEC ago."""
+    now = time.monotonic()
+    last = _PLAY_LAST_CALL.get(user_id, 0.0)
+    if now - last < _PLAY_COOLDOWN_SEC:
+        return True
+    _PLAY_LAST_CALL[user_id] = now
+    return False
+
+
+# ── Admin check ───────────────────────────────────────────────────────────────
+
+async def _is_admin_or_owner(
+    client: Client,
+    chat_id: int,
+    user_id: int,
+    owner_id: int,
+) -> bool:
+    """
+    Return True when *user_id* is the bot owner, a group admin, or the group
+    owner.  Falls back to True on API errors (defensive: don't block users
+    when Telegram is flaky).
+    """
+    if user_id == owner_id:
+        return True
+    try:
+        member = await client.get_chat_member(chat_id, user_id)
+        return isinstance(member, (ChatMemberOwner, ChatMemberAdministrator))
+    except Exception as exc:
+        logger.debug(
+            "Admin check failed chat={} user={} — defaulting to allow: {}",
+            chat_id, user_id, exc,
+        )
+        return True  # fail-open so legitimate users aren't blocked by API hiccups
+
+
+def register(client: Client, engine: MusicEngine, owner_id: int = 0) -> None:
+    """
+    Attach all music handlers to *client*.
+
+    Parameters
+    ----------
+    client:
+        Pyrogram Client (bot account).
+    engine:
+        Shared MusicEngine instance.
+    owner_id:
+        Telegram user ID of the bot owner.  Users with this ID can control
+        playback regardless of group admin status.
+    """
 
     # ── /play ─────────────────────────────────────────────────────────────────
     @client.on_message(filters.command("play") & filters.group)
@@ -40,6 +107,15 @@ def register(client: Client, engine: MusicEngine) -> None:
 
         user = msg.from_user
         if user is None:
+            return
+
+        # Rate limit — prevents executor saturation from rapid-fire requests
+        if _is_rate_limited(user.id):
+            await msg.reply_text(
+                f"⏳ Slow down! Please wait {_PLAY_COOLDOWN_SEC:.0f} seconds "
+                "between play requests.",
+                quote=True,
+            )
             return
 
         interim = await msg.reply_text(f"🔍 Searching for **{query}**…", quote=True)
@@ -63,12 +139,8 @@ def register(client: Client, engine: MusicEngine) -> None:
             return
 
         if is_now_playing:
-            await interim.edit_text(
-                f"🎵 **Now Playing**\n\n"
-                f"**{track.title}**\n"
-                f"⏱ {track.formatted_duration}  •  👤 {track.uploader}\n"
-                f"Requested by: {user.mention}",
-            )
+            # Use shared helper so format matches auto-advance notifications
+            await interim.edit_text(format_now_playing(track))
         else:
             upcoming = await engine.get_upcoming(msg.chat.id)
             position = len(upcoming)  # track was just added; it is last in list
@@ -84,6 +156,16 @@ def register(client: Client, engine: MusicEngine) -> None:
     async def cmd_skip(c: Client, msg: Message) -> None:
         if not engine.is_active(msg.chat.id):
             await msg.reply_text("❌ Nothing is playing right now.", quote=True)
+            return
+
+        user = msg.from_user
+        if user is None:
+            return
+
+        if not await _is_admin_or_owner(c, msg.chat.id, user.id, owner_id):
+            await msg.reply_text(
+                "❌ Only group admins can skip tracks.", quote=True
+            )
             return
 
         try:
@@ -111,6 +193,16 @@ def register(client: Client, engine: MusicEngine) -> None:
     async def cmd_stop(c: Client, msg: Message) -> None:
         if not engine.is_active(msg.chat.id):
             await msg.reply_text("❌ Nothing is playing right now.", quote=True)
+            return
+
+        user = msg.from_user
+        if user is None:
+            return
+
+        if not await _is_admin_or_owner(c, msg.chat.id, user.id, owner_id):
+            await msg.reply_text(
+                "❌ Only group admins can stop playback.", quote=True
+            )
             return
 
         try:
@@ -193,6 +285,8 @@ def register(client: Client, engine: MusicEngine) -> None:
 
         except Exception as exc:
             logger.error("/queue error in chat={}: {}", msg.chat.id, exc)
-            await msg.reply_text("❌ Failed to retrieve queue. Please try again.", quote=True)
+            await msg.reply_text(
+                "❌ Failed to retrieve queue. Please try again.", quote=True
+            )
 
     logger.debug("Music handlers registered ✓")

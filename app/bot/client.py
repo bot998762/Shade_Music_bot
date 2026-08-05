@@ -82,16 +82,29 @@ class BotClient:
             raise RuntimeError("BotClient has not been started.")
         return self._client
 
-    def register_music_handlers(self, engine: object) -> None:
+    def register_music_handlers(self, engine: object, owner_id: int = 0) -> None:
         """
         Attach Phase 1 music handlers to the running client.
 
         Called by the lifecycle layer AFTER MusicEngine is fully initialised
         so the engine reference is never None when a command arrives.
+
+        Parameters
+        ----------
+        engine:
+            The running MusicEngine instance.
+        owner_id:
+            Telegram user ID of the bot owner.  Passed to the music handler
+            module so the admin guard on /skip and /stop allows the owner
+            regardless of group admin status.
         """
         from app.bot.handlers import music as music_handlers
 
-        music_handlers.register(self._client, engine)  # type: ignore[arg-type]
+        music_handlers.register(
+            self._client,  # type: ignore[arg-type]
+            engine,        # type: ignore[arg-type]
+            owner_id=owner_id,
+        )
         logger.debug("Music handler group registered")
 
     # ── Private helpers ───────────────────────────────────────────────────────

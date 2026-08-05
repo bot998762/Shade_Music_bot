@@ -38,6 +38,14 @@ Search
 ``extract_flat="in_playlist"`` prevents yt-dlp from resolving formats during
 search (we only need metadata).  Without this, yt-dlp validates every result's
 format list and fails for videos with unusual codecs (iamf, AV1-only, etc.).
+
+Fixes applied (audit 2026-08-05)
+---------------------------------
+* asyncio.get_running_loop() replaces deprecated get_event_loop().
+* asyncio.wait_for(..., timeout=60) wraps every run_in_executor call so a
+  hung yt-dlp process cannot leak an executor thread forever.
+* _YT_EXECUTOR.shutdown() is called by shutdown() — invoke from lifecycle.
+* max_workers raised from 3 to 5 for better concurrency under load.
 """
 
 from __future__ import annotations
@@ -53,8 +61,9 @@ import yt_dlp.utils
 from app.core.logger import logger
 from app.player.models import Track
 
-# Bounded executor — 3 threads is enough; yt-dlp calls are I/O-bound.
-_YT_EXECUTOR = ThreadPoolExecutor(max_workers=3, thread_name_prefix="ytdlp")
+# Bounded executor — yt-dlp calls are I/O-bound; 5 threads give decent
+# concurrency without overwhelming a Render Starter instance.
+_YT_EXECUTOR = ThreadPoolExecutor(max_workers=5, thread_name_prefix="ytdlp")
 
 # Substrings that identify a yt-dlp format-availability error.
 # We use these only in Stage 2 to decide whether to try the next selector.
@@ -64,6 +73,11 @@ _FORMAT_ERR_PHRASES = (
     "format is not available",
     "no formats",
 )
+
+# Timeout for a single yt-dlp operation (seconds).
+# A genuinely stalled yt-dlp call (bad DNS, CDN timeout) is abandoned and
+# treated as a resolution failure — the executor thread is freed.
+_YTDLP_TIMEOUT_SEC = 60
 
 # ── HTTP headers ──────────────────────────────────────────────────────────────
 _HTTP_HEADERS: Dict[str, str] = {
@@ -91,7 +105,7 @@ _BASE_OPTS: Dict = {
     "noplaylist": True,
     "geo_bypass": True,
     "nocheckcertificate": True,
-    "socket_timeout": 15,
+    "socket_timeout": 30,
     "retries": 3,
     "fragment_retries": 3,
     "http_headers": _HTTP_HEADERS,
@@ -245,6 +259,19 @@ class YouTubeService:
                 cookies_path,
             )
 
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def shutdown() -> None:
+        """
+        Gracefully shut down the shared executor.
+
+        Call from ApplicationLifecycle.stop() so in-flight yt-dlp calls are
+        not abandoned without cleanup on process exit.
+        """
+        _YT_EXECUTOR.shutdown(wait=False)
+        logger.debug("YouTubeService executor shut down")
+
     # ── Public async API ──────────────────────────────────────────────────────
 
     async def search(
@@ -261,14 +288,27 @@ class YouTubeService:
         before playback.
         """
         logger.info("YouTube search: '{}'", query)
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            _YT_EXECUTOR,
-            self._sync_search,
-            query,
-            requested_by_id,
-            requested_by_name,
-        )
+        # get_running_loop() is the correct call inside a running coroutine.
+        # get_event_loop() is deprecated for this use-case in Python 3.10+.
+        loop = asyncio.get_running_loop()
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(
+                    _YT_EXECUTOR,
+                    self._sync_search,
+                    query,
+                    requested_by_id,
+                    requested_by_name,
+                ),
+                timeout=_YTDLP_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "YouTube search timed out after {}s for query: '{}'",
+                _YTDLP_TIMEOUT_SEC,
+                query,
+            )
+            return None
 
     async def get_stream_url(self, webpage_url: str) -> Optional[str]:
         """
@@ -277,12 +317,23 @@ class YouTubeService:
         Always call this immediately before playback — the URL expires quickly.
         Returns ``None`` on failure.
         """
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            _YT_EXECUTOR,
-            self._sync_get_stream_url,
-            webpage_url,
-        )
+        loop = asyncio.get_running_loop()
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(
+                    _YT_EXECUTOR,
+                    self._sync_get_stream_url,
+                    webpage_url,
+                ),
+                timeout=_YTDLP_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Stream URL resolution timed out after {}s for: '{}'",
+                _YTDLP_TIMEOUT_SEC,
+                webpage_url,
+            )
+            return None
 
     # ── Private sync workers ──────────────────────────────────────────────────
 
@@ -329,7 +380,9 @@ class YouTubeService:
                 )
             )
             if not webpage_url:
-                logger.warning("Search: could not determine webpage_url for '{}'", query)
+                logger.warning(
+                    "Search: could not determine webpage_url for '{}'", query
+                )
                 return None
 
             # Thumbnail: scalar field or last item in thumbnails list
@@ -390,8 +443,6 @@ class YouTubeService:
         ``formats[]`` without processing), try ``bestaudio/best`` then ``best``
         as explicit selectors.  With ``player_client=["android_vr"]`` in
         ``_BASE_OPTS``, these selectors now resolve successfully from server IPs.
-        Unlike the old 3-selector chain, each selector here is genuinely
-        different and only tried once.
         """
         logger.debug("Resolving stream URL for '{}'", webpage_url)
 
@@ -480,7 +531,7 @@ class YouTubeService:
 
             formats: List[Dict] = entry.get("formats") or []
 
-            # Log a compact summary so format issues are diagnosable in Render logs.
+            # Log a compact summary so format issues are diagnosable in logs.
             if formats:
                 sample = [
                     f"{f.get('ext','?')}/"

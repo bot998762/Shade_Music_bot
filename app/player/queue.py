@@ -86,6 +86,17 @@ class QueueManager:
         """Overwrite the current-track slot (used when starting playback)."""
         self._current[chat_id] = track
 
+    async def prepend(self, chat_id: int, track: Track) -> None:
+        """
+        Insert *track* at the HEAD of the upcoming queue.
+
+        Used by MusicEngine._start_next() to restore a track when a VC join
+        fails, so the track is not permanently lost.
+        """
+        async with self._lock_for(chat_id):
+            q = self._queue_for(chat_id)
+            q.appendleft(track)
+
     async def clear(self, chat_id: int) -> None:
         """Discard all upcoming tracks and clear the current-track slot."""
         async with self._lock_for(chat_id):
