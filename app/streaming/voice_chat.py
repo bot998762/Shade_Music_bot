@@ -11,7 +11,7 @@ Imports that work:
     from pytgcalls import PyTgCalls
     from pytgcalls import filters as fl
     from pytgcalls.types import Update, ChatUpdate, MediaStream, AudioQuality
-    from pytgcalls.types.stream import StreamAudioEnded   ← pytgcalls.types.stream submodule
+    from pytgcalls.types.stream import StreamEnded as StreamAudioEnded   ← pytgcalls.types.stream submodule
 
 ChatUpdate.Status values (from pyrogram_client.py source):
     ChatUpdate.Status.CLOSED_VOICE_CHAT   ← GroupCallDiscarded
@@ -33,7 +33,7 @@ from pyrogram import Client
 from pytgcalls import PyTgCalls
 from pytgcalls import filters as fl
 from pytgcalls.types import AudioQuality, ChatUpdate, MediaStream, Update
-from pytgcalls.types.stream import StreamAudioEnded
+from pytgcalls.types.stream import StreamEnded as StreamAudioEnded
 
 from app.core.logger import logger
 
