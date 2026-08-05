@@ -3,45 +3,42 @@ app.streaming.ffmpeg
 ~~~~~~~~~~~~~~~~~~~~
 Centralised factory for pytgcalls MediaStream objects.
 
-py-tgcalls 2.3+ API — verified against:
-  • pytgcalls/pytgcalls master (2025-08-05)
-  • AsmSafone/MusicPlayer main.py (production reference)
-  • Official examples: piped_audio_calls, remote_piped_play
+pytgcalls 0.9.x API reference
+------------------------------
+    from pytgcalls.types import MediaStream, AudioQuality, AudioParameters
 
-Confirmed API surface (py-tgcalls >= 2.3.0):
-  from pytgcalls.types import MediaStream, AudioQuality, AudioParameters
+    MediaStream(
+        media_path,                             # direct URL or file path
+        audio_parameters=AudioQuality.HIGH,     # keyword arg — stable across minor versions
+        video_flags=MediaStream.Flags.IGNORE,   # audio-only; do not wait for a video track
+        ffmpeg_parameters="...",                # extra FFmpeg CLI flags (prepended to input)
+    )
 
-  MediaStream(
-      media_path,
-      audio_parameters=AudioParameters(),   # keyword, not positional
-      video_flags=MediaStream.Flags.IGNORE, # audio-only
-      ffmpeg_parameters="...",              # extra FFmpeg CLI args
-  )
+    AudioQuality convenience enum (values are AudioParameters instances):
+        AudioQuality.LOW    — 48 kbps stereo
+        AudioQuality.MEDIUM — 96 kbps stereo
+        AudioQuality.HIGH   — 128 kbps stereo  (production default)
+        AudioQuality.STUDIO — 320 kbps stereo
 
-  AudioQuality is a convenience enum whose values ARE AudioParameters instances:
-      AudioQuality.HIGH   == AudioParameters(bitrate=128000, channels=2)
-      AudioQuality.STUDIO == AudioParameters(bitrate=320000, channels=2)
+FFmpeg reconnect flags
+----------------------
+YouTube's googlevideo.com CDN occasionally drops connections mid-stream,
+especially on server/datacenter IPs (Render, AWS, etc.).  The reconnect
+flags instruct FFmpeg to re-attempt the HTTP connection automatically:
 
-Breaking changes vs older code:
-  WRONG (positional, unreliable across 2.x minor versions):
-      MediaStream(url, AudioQuality.HIGH, video_flags=...)
-  CORRECT (keyword, stable):
-      MediaStream(url, audio_parameters=AudioQuality.HIGH, video_flags=...)
+    -reconnect 1              — reconnect on disconnect
+    -reconnect_streamed 1     — reconnect even for live/streamed sources
+    -reconnect_delay_max 5    — give up after 5 s if reconnect fails
 
-  WRONG:  video_flags=MediaStream.IGNORE
-  CORRECT: video_flags=MediaStream.Flags.IGNORE
+These flags are safe for all HTTPS URLs and are ignored silently by FFmpeg
+when the source is a local file.
 """
 
 from __future__ import annotations
 
 from pytgcalls.types import AudioQuality, MediaStream
 
-# FFmpeg flags that improve stability when streaming from remote HTTPS URLs
-# (YouTube DASH segments on googlevideo.com):
-#   -reconnect 1               — reconnect on disconnect
-#   -reconnect_streamed 1      — reconnect even for streamed sources
-#   -reconnect_delay_max 5     — give up after 5 s without reconnect
-#   -vn                        — discard video track at FFmpeg level (belt+suspenders)
+# FFmpeg flags injected before the input URL for CDN resilience.
 _FFMPEG_RECONNECT = (
     "-reconnect 1 "
     "-reconnect_streamed 1 "
@@ -51,12 +48,12 @@ _FFMPEG_RECONNECT = (
 
 class FFmpegStreamBuilder:
     """
-    Builds MediaStream objects for py-tgcalls 2.3+.
+    Factory for MediaStream objects compatible with pytgcalls 0.9.x.
 
     Usage
     -----
     stream = FFmpegStreamBuilder.build(url)
-    stream = FFmpegStreamBuilder.build(url, quality=AudioQuality.MEDIUM)
+    stream = FFmpegStreamBuilder.build(url, quality=AudioQuality.STUDIO)
     """
 
     @staticmethod
@@ -72,24 +69,27 @@ class FFmpegStreamBuilder:
         ----------
         stream_url:
             Direct audio URL returned by YouTubeService (HTTPS).
+            Must be a pre-signed URL that FFmpeg can open without auth headers.
         quality:
             AudioQuality.LOW | .MEDIUM | .HIGH | .STUDIO
-            Defaults to HIGH (128 kbps, stereo).
+            Defaults to HIGH (128 kbps stereo) — best balance of quality vs
+            bandwidth on Render Starter.
 
-        Notes
-        -----
-        audio_parameters is passed as a keyword argument — required for
-        compatibility across all py-tgcalls 2.x minor versions.
+        Notes on keyword arguments
+        --------------------------
+        ``audio_parameters`` is passed as a keyword argument, not positional.
+        Positional argument order changed across pytgcalls minor versions;
+        keyword arguments are stable.
 
-        video_flags=MediaStream.Flags.IGNORE tells ntgcalls not to wait for
-        a video track, preventing the call from stalling on audio-only URLs.
+        ``video_flags=MediaStream.Flags.IGNORE`` tells ntgcalls not to wait
+        for a video stream, preventing calls from stalling on audio-only URLs.
 
-        ffmpeg_parameters adds reconnect flags so a brief CDN hiccup (common
-        with googlevideo.com on Render) does not permanently drop the stream.
+        ``ffmpeg_parameters`` inserts reconnect flags before the input so
+        brief CDN hiccups do not permanently terminate the stream.
         """
         return MediaStream(
             stream_url,
-            audio_parameters=quality,                  # keyword — stable across 2.x
-            video_flags=MediaStream.Flags.IGNORE,      # audio-only stream
-            ffmpeg_parameters=_FFMPEG_RECONNECT,       # resilience on remote URLs
+            audio_parameters=quality,              # keyword — stable across 0.9.x
+            video_flags=MediaStream.Flags.IGNORE,  # audio-only; no video wait
+            ffmpeg_parameters=_FFMPEG_RECONNECT,   # CDN resilience for HTTPS URLs
         )

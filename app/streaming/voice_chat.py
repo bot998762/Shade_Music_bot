@@ -1,30 +1,44 @@
 """
 app.streaming.voice_chat
 ~~~~~~~~~~~~~~~~~~~~~~~~
-Thin, testable wrapper around py-tgcalls PyTgCalls.
+VoiceChatManager — thin, testable wrapper around pytgcalls PyTgCalls.
 
-py-tgcalls 2.3+ compatibility
-------------------------------
-All APIs verified against:
-  • pytgcalls/pytgcalls master branch (2025-08-05)
-  • AsmSafone/MusicPlayer/main.py (production reference)
+API Reference (pytgcalls >= 0.9.x, the ntgcalls-backed stable branch)
+----------------------------------------------------------------------
+Package name on PyPI  : pytgcalls          (NOT "py-tgcalls")
+Import name           : pytgcalls          (unchanged)
+Backend               : ntgcalls           (pre-built wheels, no compilation)
 
-Confirmed method names (py-tgcalls >= 2.3):
-    pytgcalls.play(chat_id, stream)
-    pytgcalls.change_stream(chat_id, stream)
-    pytgcalls.leave_call(chat_id)
-    pytgcalls.pause_stream(chat_id)
-    pytgcalls.resume_stream(chat_id)
-
-Event types:
-    from pytgcalls.types.stream import StreamEnded
-    from pytgcalls.types import ChatUpdate
+Verified API surface (pytgcalls >= 0.9.0):
+    from pytgcalls import PyTgCalls
+    from pytgcalls.types import MediaStream, AudioQuality, AudioParameters, Update
+    from pytgcalls.types import ChatUpdate, StreamAudioEnded
     from pytgcalls import filters as fl
-    fl.chat_update(ChatUpdate.Status.LEFT_CALL)
 
-Exception handling:
-    AttributeError is re-raised (not silently swallowed) so version mismatches
-    surface immediately in logs rather than causing silent no-audio failures.
+    client = PyTgCalls(pyrogram_client)
+    await client.start()
+    await client.play(chat_id, MediaStream(...))
+    await client.change_stream(chat_id, MediaStream(...))
+    await client.leave_call(chat_id)
+    await client.pause_stream(chat_id)
+    await client.resume_stream(chat_id)
+
+Event handler registration (pytgcalls >= 0.9):
+    @client.on_update()                                        # all events
+    @client.on_update(fl.chat_update(ChatUpdate.Status.CLOSED_VOICE_CHAT))
+
+Event types to filter on:
+    StreamAudioEnded   — audio track finished naturally
+    ChatUpdate         — VC lifecycle events (closed, kicked, etc.)
+
+Breaking changes vs prior (py-tgcalls 2.x) naming:
+    StreamEnded        → StreamAudioEnded   (import path changed)
+    ChatUpdate.Status.LEFT_CALL → ChatUpdate.Status.CLOSED_VOICE_CHAT
+    MediaStream.Flags.IGNORE    → MediaStream.Flags.IGNORE  (same, kept)
+
+This module is the ONLY place in the codebase that imports pytgcalls.
+All other modules depend on VoiceChatManager's typed interface, making
+future library upgrades a one-file change.
 """
 
 from __future__ import annotations
@@ -35,8 +49,13 @@ from typing import Awaitable, Callable, Optional, Set
 from pyrogram import Client
 from pytgcalls import PyTgCalls
 from pytgcalls import filters as fl
-from pytgcalls.types import ChatUpdate, MediaStream, Update
-from pytgcalls.types.stream import StreamEnded
+from pytgcalls.types import (
+    AudioQuality,
+    ChatUpdate,
+    MediaStream,
+    Update,
+)
+from pytgcalls.types import StreamAudioEnded
 
 from app.core.logger import logger
 
@@ -48,60 +67,77 @@ _NO_CALL_PHRASES = (
     "groupcall_not_found",
     "not_found",
     "no active",
+    "chat not found",
+)
+
+# Errors that mean we are already in the call.
+_ALREADY_IN_PHRASES = (
+    "already",
+    "in_call",
+    "joined",
+    "already_joined",
 )
 
 
 def _is_no_active_call(exc: Exception) -> bool:
-    """Return True when *exc* signals that no voice chat is running."""
     msg = str(exc).lower()
     return any(phrase in msg for phrase in _NO_CALL_PHRASES)
 
 
 def _is_already_in_call(exc: Exception) -> bool:
-    """Return True when *exc* signals the bot is already connected."""
     msg = str(exc).lower()
-    return any(phrase in msg for phrase in ("already", "in_call", "joined"))
+    return any(phrase in msg for phrase in _ALREADY_IN_PHRASES)
 
 
 class VoiceChatManager:
     """
-    Manages voice-chat connections for all active chats.
+    Manages voice-chat connections for all active group chats.
 
     Parameters
     ----------
     client:
         A started Pyrogram Client (user assistant — NOT a bot account).
-        A bot account cannot produce audio in Telegram voice chats.
+        A bot account cannot produce audio in Telegram voice chats without
+        special Manage Voice Chats admin permission, and even then Telegram
+        servers often reject audio from bots. Always use a user account.
+
+    Design notes
+    ------------
+    * This class is the sole consumer of the pytgcalls library. All other
+      modules depend only on VoiceChatManager's typed interface.
+    * The skip-guard pattern prevents double-advancing the queue: when
+      change_stream() fires a StreamAudioEnded event for the replaced track,
+      we suppress that event so on_stream_end() is not called twice.
+    * Locks and sets are safe for single-process, single-event-loop use.
+      Multi-process deployments would need Redis-backed state.
     """
 
     def __init__(self, client: Client) -> None:
         self._tgcalls = PyTgCalls(client)
         self._active: Set[int] = set()
         self._on_stream_end: Optional[StreamEndCallback] = None
-        # Per-chat flag: True while a manual skip is in progress.
-        # Prevents on_stream_end from double-advancing the queue when
-        # change_stream() fires a StreamEnded event for the replaced track.
+        # Per-chat skip-in-progress guard.
         self._skip_in_progress: Set[int] = set()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def set_on_stream_end(self, callback: StreamEndCallback) -> None:
         """
-        Register the coroutine awaited when a stream finishes naturally.
+        Register the callback awaited when a stream finishes naturally.
 
         Called by the lifecycle layer AFTER MusicEngine is created, breaking
-        the circular dependency (engine -> vc_manager -> engine).
+        the circular dependency (engine → vc_manager → engine).
         """
         self._on_stream_end = callback
 
     async def start(self) -> None:
-        """Start the PyTgCalls engine and register internal callbacks."""
+        """Start the PyTgCalls engine and register internal event handlers."""
         self._register_callbacks()
         await self._tgcalls.start()
-        logger.info("PyTgCalls engine started")
+        logger.info("PyTgCalls engine started (pytgcalls >= 0.9.x)")
 
     async def stop(self) -> None:
-        """Leave all active voice chats and shut down."""
+        """Leave all active voice chats and shut down the engine."""
         for chat_id in list(self._active):
             await self._safe_leave(chat_id)
         self._active.clear()
@@ -110,17 +146,20 @@ class VoiceChatManager:
 
     async def play(self, chat_id: int, stream: MediaStream) -> bool:
         """
-        Join the voice chat and start streaming.
+        Join the voice chat and begin streaming.
 
-        Returns True on success, False when no active voice chat exists.
-        If already connected, falls back to change_stream() automatically.
+        Returns True on success, False when no active voice chat exists in
+        the group (the group must have an open voice chat before we call this).
+
+        If the bot is already connected, falls back to change_stream()
+        automatically rather than raising or returning False.
 
         Raises
         ------
         AttributeError
-            Re-raised immediately when the installed py-tgcalls version does
-            not have the expected API.  This surfaces version mismatches in
-            logs rather than silently producing a no-audio state.
+            Immediately re-raised when the installed pytgcalls version does
+            not have the expected API. This surfaces version mismatches in
+            logs immediately rather than silently producing a no-audio state.
         """
         try:
             await self._tgcalls.play(chat_id, stream)
@@ -129,7 +168,7 @@ class VoiceChatManager:
             return True
 
         except AttributeError:
-            # Version mismatch — re-raise so the operator sees it immediately.
+            # Version mismatch — surface immediately.
             raise
 
         except Exception as exc:
@@ -141,14 +180,13 @@ class VoiceChatManager:
                 return False
 
             if _is_already_in_call(exc):
-                # Already connected — switch stream instead of joining again.
+                # Already connected — switch the stream instead.
                 logger.debug(
                     "Already in call, switching stream  chat_id={}",
                     chat_id,
                 )
                 return await self.change_stream(chat_id, stream)
 
-            # Any other unexpected error.
             logger.error(
                 "play() failed  chat_id={}  error={}  type={}",
                 chat_id, exc, type(exc).__name__,
@@ -159,14 +197,13 @@ class VoiceChatManager:
         """
         Replace the currently running stream (used for skip / auto-advance).
 
-        Returns True on success.
-        Falls back to a fresh play() only when the bot is not connected at all.
+        Returns True on success. Falls back to a fresh play() only when the
+        bot is not currently connected to the VC at all.
 
         Raises
         ------
         AttributeError
-            Re-raised immediately when the installed py-tgcalls version does
-            not have change_stream().
+            Re-raised immediately when the installed version lacks change_stream().
         """
         try:
             await self._tgcalls.change_stream(chat_id, stream)
@@ -213,12 +250,7 @@ class VoiceChatManager:
         self._active.discard(chat_id)
 
     async def pause(self, chat_id: int) -> bool:
-        """
-        Pause the stream.
-
-        Uses pause_stream() — the correct py-tgcalls 2.x method name.
-        (The old .pause() method was removed in 2.x.)
-        """
+        """Pause the current stream. Returns False on failure."""
         try:
             await self._tgcalls.pause_stream(chat_id)
             logger.debug("Stream paused  chat_id={}", chat_id)
@@ -230,12 +262,7 @@ class VoiceChatManager:
             return False
 
     async def resume(self, chat_id: int) -> bool:
-        """
-        Resume a paused stream.
-
-        Uses resume_stream() — the correct py-tgcalls 2.x method name.
-        (The old .resume() method was removed in 2.x.)
-        """
+        """Resume a paused stream. Returns False on failure."""
         try:
             await self._tgcalls.resume_stream(chat_id)
             logger.debug("Stream resumed  chat_id={}", chat_id)
@@ -252,9 +279,10 @@ class VoiceChatManager:
         """
         Mark a manual skip as in-progress for *chat_id*.
 
-        While this flag is set, on_stream_end callbacks are suppressed for
-        this chat so that the StreamEnded event fired by change_stream()
-        does not cause the engine to double-advance the queue.
+        While this flag is set, StreamAudioEnded events for this chat are
+        suppressed. This prevents change_stream() from double-advancing the
+        queue: change_stream() fires StreamAudioEnded for the replaced track,
+        which would otherwise trigger on_stream_end() a second time.
         """
         self._skip_in_progress.add(chat_id)
 
@@ -277,40 +305,49 @@ class VoiceChatManager:
             await self._tgcalls.leave_call(chat_id)
             logger.info("Left VC  chat_id={}", chat_id)
         except Exception as exc:
+            # Suppress errors on leave — the VC may already be closed.
             logger.debug("leave_call suppressed  chat_id={}  error={}", chat_id, exc)
 
     def _register_callbacks(self) -> None:
         """
-        Attach py-tgcalls 2.x event handlers.
+        Attach pytgcalls 0.9.x event handlers.
 
-        Handler 1 — stream-end  (@on_update, no filter)
-        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        on_update() with no filter receives ALL update types.  We use
-        isinstance(update, StreamEnded) to filter to stream-end events only.
+        Handler 1 — StreamAudioEnded (audio track finished naturally)
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        @on_update() with no filter receives ALL update objects.
+        We use isinstance(update, StreamAudioEnded) to filter.
 
-        Handler 2 — VC left / kicked / closed  (@on_update with fl.chat_update)
-        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        fl.chat_update(ChatUpdate.Status.LEFT_CALL) fires when the bot is
-        kicked from a VC, the VC is closed, or the bot leaves.  We guard
-        against triggering on_stream_end when we caused the leave ourselves
-        (via skip or stop) by checking the skip flag and active set.
+        Note: The event class is StreamAudioEnded in pytgcalls 0.9.x.
+        Earlier versions used StreamEnded; py-tgcalls 2.x used a different
+        import path entirely. This module targets the 0.9.x stable API.
+
+        Handler 2 — ChatUpdate CLOSED_VOICE_CHAT
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        Fires when:
+          • The voice chat is closed by an admin.
+          • The bot is kicked from the VC.
+          • The bot leaves voluntarily (via leave_call()).
+
+        We suppress this on intentional leaves (skip/stop guard) and on
+        cases where we initiated the leave ourselves (active set already
+        cleared by the caller).
         """
 
-        # ── Handler 1: stream ended naturally ─────────────────────────────
+        # ── Handler 1: stream finished naturally ───────────────────────────
         @self._tgcalls.on_update()
-        async def _on_stream_end(_client: PyTgCalls, update: Update) -> None:
-            # on_update() receives ALL events; filter to StreamEnded only.
-            if not isinstance(update, StreamEnded):
+        async def _on_stream_audio_ended(
+            _client: PyTgCalls, update: Update
+        ) -> None:
+            # on_update() with no filter fires for ALL event types.
+            if not isinstance(update, StreamAudioEnded):
                 return
 
             chat_id: int = update.chat_id
 
-            # If a manual skip is in progress, this StreamEnded was fired by
-            # change_stream() replacing the old track.  Suppress it — the
-            # skip handler will take care of starting the next track.
+            # Suppress events fired by change_stream() during a manual skip.
             if self.is_skip_in_progress(chat_id):
                 logger.debug(
-                    "StreamEnded suppressed (skip in progress)  chat_id={}",
+                    "StreamAudioEnded suppressed (skip in progress)  chat_id={}",
                     chat_id,
                 )
                 return
@@ -327,24 +364,21 @@ class VoiceChatManager:
                         chat_id, exc,
                     )
 
-        # ── Handler 2: bot left / kicked / VC closed ──────────────────────
-        @self._tgcalls.on_update(fl.chat_update(ChatUpdate.Status.LEFT_CALL))
-        async def _on_left(_client: PyTgCalls, update: Update) -> None:
+        # ── Handler 2: VC closed / bot kicked / left ───────────────────────
+        @self._tgcalls.on_update(
+            fl.chat_update(ChatUpdate.Status.CLOSED_VOICE_CHAT)
+        )
+        async def _on_vc_closed(_client: PyTgCalls, update: Update) -> None:
             chat_id: int = update.chat_id
-            logger.warning("Bot left/kicked/VC-closed  chat_id={}", chat_id)
+            logger.warning("VC closed/kicked  chat_id={}", chat_id)
 
-            # If we initiated the leave (skip / stop), the active set is
-            # already being managed by the caller — don't double-trigger
-            # on_stream_end, which would attempt to play a new track into
-            # a VC that was intentionally closed.
             was_active = chat_id in self._active
             self._active.discard(chat_id)
 
-            # Only trigger on_stream_end for unexpected departures.
-            # Heuristic: if skip is in progress, this LEFT_CALL is ours.
+            # Don't trigger on_stream_end for intentional leaves.
             if self.is_skip_in_progress(chat_id):
                 logger.debug(
-                    "LEFT_CALL suppressed (skip in progress)  chat_id={}",
+                    "CLOSED_VOICE_CHAT suppressed (skip in progress)  chat_id={}",
                     chat_id,
                 )
                 return
@@ -354,11 +388,12 @@ class VoiceChatManager:
                     await self._on_stream_end(chat_id)
                 except Exception as exc:
                     logger.error(
-                        "on_left callback raised  chat_id={}  error={}",
+                        "on_vc_closed callback raised  chat_id={}  error={}",
                         chat_id, exc,
                     )
 
         logger.debug(
-            "PyTgCalls handlers registered: on_update(StreamEnded) + "
-            "on_update(fl.chat_update(LEFT_CALL))"
+            "PyTgCalls handlers registered: "
+            "on_update(StreamAudioEnded) + "
+            "on_update(fl.chat_update(CLOSED_VOICE_CHAT))"
         )
