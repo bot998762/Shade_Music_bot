@@ -65,9 +65,12 @@ _SEARCH_OPTS: Dict = {
 }
 
 # ── Stream-URL opts (full extraction) ─────────────────────────────────────────
-# No extract_flat — we need the actual direct audio URL.
-# format="bestaudio/best" → yt-dlp selects the best audio-only stream;
-#   info["url"] is the direct CDN URL, ready for FFmpeg/ntgcalls.
+# No extract_flat — we need actual format data, not just metadata.
+# NO format selector — android client returns different format IDs than web
+#   client. "bestaudio/best" fails with "Requested format is not available"
+#   because yt-dlp can't find a matching format in android's response.
+#   Instead, we fetch ALL formats and pick the best audio-only stream manually
+#   in _sync_get_stream_url() using the formats list.
 # android player_client bypasses PO Token requirement on datacenter IPs.
 # cookiefile is added dynamically in _build_opts() if cookies are available.
 _STREAM_OPTS: Dict = {
@@ -78,7 +81,7 @@ _STREAM_OPTS: Dict = {
     "geo_bypass": True,
     "socket_timeout": 25,
     "retries": 3,
-    "format": "bestaudio/best",
+    # format intentionally omitted — manual selection in _sync_get_stream_url
     "extractor_args": {
         "youtube": {
             "player_client": ["android", "web"],
@@ -305,32 +308,49 @@ class YouTubeService:
                 logger.warning("get_stream_url: no info returned for '{}'", webpage_url)
                 return None
 
-            # Case 1: single format already selected by yt-dlp
-            direct_url: Optional[str] = info.get("url")
+            formats: List[Dict] = info.get("formats") or []
 
-            # Case 2: multiple formats available — pick best audio-only
-            if not direct_url:
-                formats: List[Dict] = info.get("formats") or []
-
-                # Prefer audio-only formats (no video stream to decode)
-                audio_only = [
+            # Case 1: no format selector used → pick best audio-only by bitrate
+            # Priority 1 — audio-only streams (vcodec is none/null)
+            audio_only = [
+                f for f in formats
+                if f.get("url")
+                and f.get("acodec") not in (None, "none")
+                and f.get("vcodec") in (None, "none")
+            ]
+            if audio_only:
+                # Sort by audio bitrate descending; tbr is total bitrate (= abr for audio-only)
+                best = sorted(
+                    audio_only,
+                    key=lambda f: float(f.get("tbr") or f.get("abr") or 0),
+                    reverse=True,
+                )
+                direct_url: Optional[str] = best[0]["url"]
+                logger.debug(
+                    "Format selected: audio-only acodec={} abr={}kbps",
+                    best[0].get("acodec"), best[0].get("abr") or best[0].get("tbr"),
+                )
+            else:
+                # Priority 2 — muxed streams (any format that has audio)
+                with_audio = [
                     f for f in formats
-                    if f.get("acodec") not in (None, "none")
-                    and f.get("vcodec") in (None, "none")
-                    and f.get("url")
+                    if f.get("url")
+                    and f.get("acodec") not in (None, "none")
                 ]
-                if audio_only:
-                    # Last entry is highest quality in yt-dlp's sorted list
-                    direct_url = audio_only[-1]["url"]
+                if with_audio:
+                    best_mux = sorted(
+                        with_audio,
+                        key=lambda f: float(f.get("tbr") or 0),
+                        reverse=True,
+                    )
+                    direct_url = best_mux[0]["url"]
+                    logger.debug(
+                        "Format selected: muxed ext={} tbr={}kbps",
+                        best_mux[0].get("ext"), best_mux[0].get("tbr"),
+                    )
                 else:
-                    # Fallback: any format with audio
-                    with_audio = [
-                        f for f in formats
-                        if f.get("acodec") not in (None, "none")
-                        and f.get("url")
-                    ]
-                    if with_audio:
-                        direct_url = with_audio[-1]["url"]
+                    # Priority 3 — single-format response (info["url"] set directly)
+                    direct_url = info.get("url")
 
             if direct_url:
                 logger.info(
