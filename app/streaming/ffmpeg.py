@@ -1,29 +1,28 @@
 """
 app.streaming.ffmpeg
 ~~~~~~~~~~~~~~~~~~~~
-Factory for MediaStream objects — py-tgcalls==2.3.3 confirmed API.
+Factory for MediaStream objects — py-tgcalls==2.3.3.
 
-Render Secret Files location
------------------------------
-Render stores Secret Files at /etc/secrets/<filename>.
-The app root also gets a symlink but /etc/secrets is authoritative.
+Cookies strategy on Render
+----------------------------
+Render Secret Files: /etc/secrets/cookies.txt (read-only)
+yt-dlp needs write access alongside cookies for lock files.
 
-Our cookies.txt is at: /etc/secrets/cookies.txt
+YouTubeService.__init__ already copies:
+    /etc/secrets/cookies.txt  →  /tmp/cookies.txt  (writable)
 
-We resolve in this order:
-  1. /etc/secrets/<basename>   ← Render Secret Files (primary)
-  2. Absolute path if provided
-  3. Relative to /app (project root)
-  4. Relative to cwd
+So _resolve_cookies() checks /tmp/ first — it will always find it there
+after YouTubeService starts. Falls back through other locations for
+non-Render environments (local dev, Docker without secrets, etc).
 
 MediaStream ytdlp_parameters confirmed from official pytgcalls example:
-  MediaStream(url, AudioQuality.HIGH, ..., ytdlp_parameters='--proxy URL')
-We use: ytdlp_parameters='--cookies /etc/secrets/cookies.txt'
+    MediaStream(url, AudioQuality.HIGH, ..., ytdlp_parameters='--proxy URL')
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 from typing import Optional
 
 from pytgcalls.types import AudioQuality, MediaStream
@@ -37,60 +36,55 @@ _PROJECT_ROOT = os.path.dirname(
 
 def _resolve_cookies(cookies_path: Optional[str]) -> Optional[str]:
     """
-    Resolve cookies_path to a WRITABLE absolute path for yt-dlp.
+    Resolve cookies_path to a writable absolute path for yt-dlp.
 
-    /etc/secrets is read-only on Render — yt-dlp tries to write a lock file
-    next to cookies.txt and raises [Errno 30] Read-only file system.
-    We always copy to /tmp/<filename> which is writable.
-
-    Lookup order for source file:
-      1. /etc/secrets/<basename>  — Render Secret Files
-      2. Already-absolute path
-      3. Relative to project root
-      4. Relative to cwd
+    Check order:
+      1. /tmp/<basename>          — already copied here by YouTubeService
+      2. /etc/secrets/<basename>  — Render Secret Files (read-only, copy to /tmp)
+      3. Absolute path as-is
+      4. Relative to project root
     """
     if not cookies_path:
         return None
 
-    import shutil
     filename = os.path.basename(cookies_path)
     tmp_path = f"/tmp/{filename}"
 
-    # Find the source file
-    candidates = [
-        f"/etc/secrets/{filename}",
-        cookies_path if os.path.isabs(cookies_path) else "",
-        os.path.join(_PROJECT_ROOT, cookies_path),
-        os.path.join(os.getcwd(), cookies_path),
-    ]
-    source: Optional[str] = None
-    for c in candidates:
-        if c and os.path.isfile(c):
-            source = c
-            break
-
-    if not source:
-        logger.warning(
-            "cookies.txt not found — checked: {} — streaming without auth",
-            ", ".join(c for c in candidates if c),
-        )
-        return None
-
-    # Copy to /tmp so yt-dlp can write its lock file alongside it
-    try:
-        shutil.copy2(source, tmp_path)
-        logger.debug("Cookies: copied {} → {}", source, tmp_path)
+    # 1. Already in /tmp (YouTubeService copies it there at startup)
+    if os.path.isfile(tmp_path):
+        logger.debug("Cookies: using /tmp copy  path={}", tmp_path)
         return tmp_path
-    except Exception as exc:
-        # If copy fails (e.g. /tmp full), fall back to source — may still work
-        logger.warning("Cookies: copy to /tmp failed ({}), using {} directly", exc, source)
-        return source
+
+    # 2. Render Secret Files — copy to /tmp so yt-dlp can write lock file
+    render_path = f"/etc/secrets/{filename}"
+    if os.path.isfile(render_path):
+        try:
+            shutil.copy2(render_path, tmp_path)
+            logger.info("Cookies: copied {} → {}", render_path, tmp_path)
+            return tmp_path
+        except Exception as exc:
+            logger.warning("Cookies: copy failed ({}), using {} directly", exc, render_path)
+            return render_path
+
+    # 3. Absolute path
+    if os.path.isabs(cookies_path) and os.path.isfile(cookies_path):
+        return cookies_path
+
+    # 4. Relative to project root
+    abs_path = os.path.join(_PROJECT_ROOT, cookies_path)
+    if os.path.isfile(abs_path):
+        return abs_path
+
+    logger.warning(
+        "Cookies: not found — checked /tmp/{}, /etc/secrets/{}, {} — no auth",
+        filename, filename, cookies_path,
+    )
+    return None
 
 
 class FFmpegStreamBuilder:
     """
     Factory for MediaStream objects compatible with py-tgcalls==2.3.3.
-    Always use build_from_youtube() for YouTube URLs.
     """
 
     @staticmethod
@@ -99,15 +93,14 @@ class FFmpegStreamBuilder:
         cookies_path: Optional[str] = None,
     ) -> MediaStream:
         """
-        Build a MediaStream from a YouTube watch URL.
-        Resolves cookies to absolute path and passes via ytdlp_parameters.
+        Build a MediaStream from a YouTube watch URL with cookies auth.
         """
         abs_cookies = _resolve_cookies(cookies_path)
 
         if abs_cookies:
-            logger.debug(
-                "MediaStream: YouTube + cookies  url={}  cookies={}",
-                webpage_url[:60], abs_cookies,
+            logger.info(
+                "MediaStream: YouTube + cookies  cookies={}  url={}",
+                abs_cookies, webpage_url[:60],
             )
             return MediaStream(
                 webpage_url,
@@ -117,7 +110,7 @@ class FFmpegStreamBuilder:
             )
         else:
             logger.warning(
-                "MediaStream: NO cookies — will fail on server IPs  url={}",
+                "MediaStream: NO cookies — will likely fail on server IPs  url={}",
                 webpage_url[:60],
             )
             return MediaStream(
@@ -131,7 +124,7 @@ class FFmpegStreamBuilder:
         stream_url: str,
         cookies_path: Optional[str] = None,
     ) -> MediaStream:
-        """Pre-resolved direct URL — cookies not needed."""
+        """Pre-resolved direct URL — no yt-dlp auth needed."""
         return MediaStream(
             stream_url,
             AudioQuality.HIGH,
