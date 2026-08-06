@@ -55,6 +55,13 @@ _SEARCH_OPTS: Dict = {
     "geo_bypass": True,
     "socket_timeout": 20,
     "retries": 2,
+    # android client bypasses PO Token requirement on datacenter IPs (Render/AWS/GCP).
+    # "web" kept as fallback. This is the primary fix for server IP bot-detection.
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "web"],
+        }
+    },
 }
 
 

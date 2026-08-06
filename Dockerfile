@@ -25,7 +25,7 @@ RUN pip install --upgrade pip --no-cache-dir
 
 # Copy requirements first — Docker only rebuilds this layer on file change.
 COPY requirements.txt .
-# cache-bust: 2026-08-06-v4
+# cache-bust: 2026-08-06-v5
 
 # Install into /install prefix so we can copy only what's needed to production.
 # --prefer-binary: prefer pre-built wheels over source builds (critical for
