@@ -1,32 +1,32 @@
 """
 app.services.youtube
 ~~~~~~~~~~~~~~~~~~~~
-YouTube search via yt-dlp — metadata only.
+YouTube search + stream URL extraction via yt-dlp — Python layer only.
 
-Stream URL strategy (py-tgcalls==2.3.3)
-----------------------------------------
-py-tgcalls 2.3.x includes its own yt-dlp integration. MediaStream accepts
-YouTube watch URLs directly and handles extraction internally. Therefore:
+Two-phase design
+-----------------
+Phase 1 — Search  (search())
+    extract_flat="in_playlist" — metadata only, fast, no format resolution.
+    Returns Track(webpage_url, title, duration, ...).
 
-  1. YouTubeService.search() fetches metadata only (title, duration, etc.)
-     using extract_flat="in_playlist" — fast, no format resolution.
+Phase 2 — Stream URL  (get_stream_url())
+    Full format extraction with cookies + android client in the Python layer.
+    Returns a direct CDN audio URL (expires in ~6 h — resolved just before play).
+    This is the KEY FIX: stream URL is resolved here in Python (where cookies
+    are correctly applied as a Python dict option) instead of inside ntgcalls'
+    C++ yt-dlp invocation (which ignores ytdlp_parameters in 2.2.5).
 
-  2. The webpage_url stored on Track is passed directly to MediaStream
-     via FFmpegStreamBuilder.build_from_youtube(). No pre-resolved CDN
-     URL is needed.
+Why Python extraction beats ytdlp_parameters on MediaStream
+-------------------------------------------------------------
+ntgcalls 2.2.5 accepts ytdlp_parameters as a string but does NOT forward
+--cookies or --extractor-args to its internal yt-dlp call.  Every attempt
+to pass credentials via MediaStream(ytdlp_parameters=...) results in:
 
-  3. get_stream_url() is kept as a no-op passthrough for backward
-     compatibility with any callers that still invoke it. It simply
-     returns the webpage_url unchanged so MediaStream receives the
-     YouTube URL.
+    ERROR: [youtube] ...: Sign in to confirm you're not a bot.
 
-Why server IPs fail with the web player client
-----------------------------------------------
-YouTube requires a Proof-of-Origin (PO) Token for the "web" player client
-on datacenter IPs. py-tgcalls' internal yt-dlp uses the android/iOS
-clients which bypass this requirement — which is why passing the URL
-directly to MediaStream works reliably on Render, while manual yt-dlp
-with the "web" client does not.
+By resolving the direct CDN URL here (Python yt-dlp, cookiefile dict option,
+android player_client), we hand ntgcalls a direct https://... audio URL that
+requires no further authentication — yt-dlp runs zero times inside ntgcalls.
 """
 
 from __future__ import annotations
@@ -44,7 +44,9 @@ from app.player.models import Track
 
 _YT_EXECUTOR = ThreadPoolExecutor(max_workers=3, thread_name_prefix="ytdlp_search")
 _SEARCH_TIMEOUT_SEC = 30
+_STREAM_TIMEOUT_SEC = 45   # full format extraction takes longer than flat search
 
+# ── Search opts (metadata only) ───────────────────────────────────────────────
 _SEARCH_OPTS: Dict = {
     "quiet": True,
     "no_warnings": True,
@@ -55,8 +57,28 @@ _SEARCH_OPTS: Dict = {
     "geo_bypass": True,
     "socket_timeout": 20,
     "retries": 2,
-    # android client bypasses PO Token requirement on datacenter IPs (Render/AWS/GCP).
-    # "web" kept as fallback. This is the primary fix for server IP bot-detection.
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "web"],
+        }
+    },
+}
+
+# ── Stream-URL opts (full extraction) ─────────────────────────────────────────
+# No extract_flat — we need the actual direct audio URL.
+# format="bestaudio/best" → yt-dlp selects the best audio-only stream;
+#   info["url"] is the direct CDN URL, ready for FFmpeg/ntgcalls.
+# android player_client bypasses PO Token requirement on datacenter IPs.
+# cookiefile is added dynamically in _build_opts() if cookies are available.
+_STREAM_OPTS: Dict = {
+    "quiet": True,
+    "no_warnings": True,
+    "noplaylist": True,
+    "skip_download": True,
+    "geo_bypass": True,
+    "socket_timeout": 25,
+    "retries": 3,
+    "format": "bestaudio/best",
     "extractor_args": {
         "youtube": {
             "player_client": ["android", "web"],
@@ -67,17 +89,17 @@ _SEARCH_OPTS: Dict = {
 
 class YouTubeService:
     """
-    YouTube search — returns Track metadata.
+    YouTube search + stream URL resolution.
 
-    Stream URL resolution is handled by py-tgcalls internally when
-    MediaStream receives the webpage_url directly.
+    search()         — fast metadata fetch (extract_flat), returns Track.
+    get_stream_url() — full extraction with cookies + android client,
+                       returns a direct CDN audio URL for FFmpeg.
     """
 
     def __init__(self, cookies_path: Optional[str] = None) -> None:
         self._cookies_path: Optional[str] = None
         if cookies_path:
             filename = os.path.basename(cookies_path)
-            # Render Secret Files are at /etc/secrets/<filename> — check first
             candidates = [
                 f"/etc/secrets/{filename}",
                 cookies_path,
@@ -90,9 +112,9 @@ class YouTubeService:
                     break
 
             if found:
-                # /etc/secrets is read-only on Render — yt-dlp tries to write
-                # a lock file next to cookies.txt and crashes with EROFS.
-                # Copy to /tmp (writable) before passing to yt-dlp.
+                # /etc/secrets is read-only on Render — yt-dlp writes a .lock
+                # file next to cookies.txt and crashes with EROFS on read-only FS.
+                # Copy to /tmp (writable) once at startup.
                 tmp_path = f"/tmp/{filename}"
                 try:
                     import shutil
@@ -103,7 +125,6 @@ class YouTubeService:
                         tmp_path, found,
                     )
                 except Exception as copy_err:
-                    # Fall back to original path — may still work on some envs
                     self._cookies_path = found
                     logger.warning(
                         "YouTube: could not copy cookies to /tmp ({}), using '{}' directly",
@@ -120,6 +141,8 @@ class YouTubeService:
         _YT_EXECUTOR.shutdown(wait=False)
         logger.debug("YouTubeService executor shut down")
 
+    # ── Public: search ────────────────────────────────────────────────────────
+
     async def search(
         self,
         query: str,
@@ -129,10 +152,10 @@ class YouTubeService:
         """
         Search YouTube and return the first result as a Track.
 
-        Uses extract_flat mode — no format resolution, no yt-dlp extraction
-        of the audio stream. Fast and reliable from server IPs.
-
-        Returns None on failure.
+        Uses extract_flat — metadata only, no audio CDN URL.
+        The webpage_url in the returned Track is a permanent YouTube page URL.
+        Call get_stream_url(track.webpage_url) to resolve the direct CDN URL
+        before passing to FFmpegStreamBuilder.
         """
         logger.info("YouTube search: '{}'", query)
         loop = asyncio.get_running_loop()
@@ -151,18 +174,39 @@ class YouTubeService:
             logger.error("YouTube search timed out for: '{}'", query)
             return None
 
+    # ── Public: stream URL ────────────────────────────────────────────────────
+
     async def get_stream_url(self, webpage_url: str) -> Optional[str]:
         """
-        Passthrough — returns webpage_url unchanged.
+        Resolve a direct CDN audio URL from a YouTube watch URL.
 
-        py-tgcalls handles stream URL resolution internally when
-        MediaStream receives the YouTube watch URL directly.
-        Keeping this method avoids breaking any callers that still
-        invoke it; the returned value (the YouTube URL itself) is
-        passed to FFmpegStreamBuilder.build_from_youtube() which
-        gives it directly to MediaStream.
+        Uses full yt-dlp extraction (NOT extract_flat) with:
+          - cookiefile applied as a Python dict option (guaranteed to work)
+          - android player_client (bypasses PO Token on datacenter IPs)
+
+        Returns the direct https://... audio URL on success, None on failure.
+        The caller (MusicEngine._resolve_stream) falls back to
+        FFmpegStreamBuilder.build_from_youtube() if this returns None.
+
+        NOTE: The returned CDN URL expires in ~6 hours. Always call this
+        just before playback starts, never at queue-add time.
         """
-        return webpage_url
+        logger.debug("Resolving stream URL for: {}", webpage_url)
+        loop = asyncio.get_running_loop()
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(
+                    _YT_EXECUTOR,
+                    self._sync_get_stream_url,
+                    webpage_url,
+                ),
+                timeout=_STREAM_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            logger.error("get_stream_url timed out: '{}'", webpage_url)
+            return None
+
+    # ── Private helpers ───────────────────────────────────────────────────────
 
     def _build_opts(self, base: Dict) -> Dict:
         opts = dict(base)
@@ -236,4 +280,71 @@ class YouTubeService:
             return None
         except Exception as exc:
             logger.error("Unexpected error during search '{}': {}", query, exc)
+            return None
+
+    def _sync_get_stream_url(self, webpage_url: str) -> Optional[str]:
+        """
+        Synchronous stream URL extraction — runs in the thread executor.
+
+        Extracts the best audio CDN URL using Python yt-dlp with cookies
+        and android player_client.  This is the layer where cookie auth
+        actually works — unlike ytdlp_parameters on MediaStream which
+        ntgcalls 2.2.5 silently ignores.
+
+        URL selection priority:
+          1. info["url"]  — set when yt-dlp selects a single best format
+          2. Best audio-only format from info["formats"] list
+          3. Best format with any audio from info["formats"] list
+        """
+        opts = self._build_opts(_STREAM_OPTS)
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(webpage_url, download=False)
+
+            if not info:
+                logger.warning("get_stream_url: no info returned for '{}'", webpage_url)
+                return None
+
+            # Case 1: single format already selected by yt-dlp
+            direct_url: Optional[str] = info.get("url")
+
+            # Case 2: multiple formats available — pick best audio-only
+            if not direct_url:
+                formats: List[Dict] = info.get("formats") or []
+
+                # Prefer audio-only formats (no video stream to decode)
+                audio_only = [
+                    f for f in formats
+                    if f.get("acodec") not in (None, "none")
+                    and f.get("vcodec") in (None, "none")
+                    and f.get("url")
+                ]
+                if audio_only:
+                    # Last entry is highest quality in yt-dlp's sorted list
+                    direct_url = audio_only[-1]["url"]
+                else:
+                    # Fallback: any format with audio
+                    with_audio = [
+                        f for f in formats
+                        if f.get("acodec") not in (None, "none")
+                        and f.get("url")
+                    ]
+                    if with_audio:
+                        direct_url = with_audio[-1]["url"]
+
+            if direct_url:
+                logger.info(
+                    "Stream URL resolved: {} → {}...",
+                    webpage_url[-20:], direct_url[:60],
+                )
+                return direct_url
+
+            logger.warning("get_stream_url: could not find direct URL for '{}'", webpage_url)
+            return None
+
+        except yt_dlp.utils.DownloadError as exc:
+            logger.error("get_stream_url DownloadError '{}': {}", webpage_url, exc)
+            return None
+        except Exception as exc:
+            logger.error("get_stream_url unexpected error '{}': {}", webpage_url, exc)
             return None
