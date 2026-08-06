@@ -32,6 +32,7 @@ with the "web" client does not.
 from __future__ import annotations
 
 import asyncio
+import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
 
