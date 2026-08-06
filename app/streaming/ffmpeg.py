@@ -37,47 +37,54 @@ _PROJECT_ROOT = os.path.dirname(
 
 def _resolve_cookies(cookies_path: Optional[str]) -> Optional[str]:
     """
-    Resolve cookies_path to an absolute path that actually exists.
+    Resolve cookies_path to a WRITABLE absolute path for yt-dlp.
 
-    Priority:
-      1. /etc/secrets/<basename>  — Render Secret Files (always checked first)
+    /etc/secrets is read-only on Render — yt-dlp tries to write a lock file
+    next to cookies.txt and raises [Errno 30] Read-only file system.
+    We always copy to /tmp/<filename> which is writable.
+
+    Lookup order for source file:
+      1. /etc/secrets/<basename>  — Render Secret Files
       2. Already-absolute path
-      3. Relative to /app
+      3. Relative to project root
       4. Relative to cwd
     """
     if not cookies_path:
         return None
 
+    import shutil
     filename = os.path.basename(cookies_path)
+    tmp_path = f"/tmp/{filename}"
 
-    # 1. Render Secret Files — primary location
-    render_path = f"/etc/secrets/{filename}"
-    if os.path.isfile(render_path):
-        logger.debug("Cookies: Render Secret Files  path={}", render_path)
-        return render_path
+    # Find the source file
+    candidates = [
+        f"/etc/secrets/{filename}",
+        cookies_path if os.path.isabs(cookies_path) else "",
+        os.path.join(_PROJECT_ROOT, cookies_path),
+        os.path.join(os.getcwd(), cookies_path),
+    ]
+    source: Optional[str] = None
+    for c in candidates:
+        if c and os.path.isfile(c):
+            source = c
+            break
 
-    # 2. Already absolute
-    if os.path.isabs(cookies_path) and os.path.isfile(cookies_path):
-        logger.debug("Cookies: absolute path  path={}", cookies_path)
-        return cookies_path
+    if not source:
+        logger.warning(
+            "cookies.txt not found — checked: {} — streaming without auth",
+            ", ".join(c for c in candidates if c),
+        )
+        return None
 
-    # 3. Relative to project root
-    abs_path = os.path.join(_PROJECT_ROOT, cookies_path)
-    if os.path.isfile(abs_path):
-        logger.debug("Cookies: project root  path={}", abs_path)
-        return abs_path
-
-    # 4. Relative to cwd
-    cwd_path = os.path.join(os.getcwd(), cookies_path)
-    if os.path.isfile(cwd_path):
-        logger.debug("Cookies: cwd  path={}", cwd_path)
-        return cwd_path
-
-    logger.warning(
-        "cookies.txt not found — checked: {} | {} | {} — streaming without auth",
-        render_path, abs_path, cookies_path,
-    )
-    return None
+    # Copy to /tmp so yt-dlp can write its lock file alongside it
+    try:
+        shutil.copy2(source, tmp_path)
+        logger.debug("Cookies: copied {} → {}", source, tmp_path)
+        return tmp_path
+    except Exception as exc:
+        # If copy fails (e.g. /tmp full), fall back to source — may still work
+        logger.warning("Cookies: copy to /tmp failed ({}), using {} directly", exc, source)
+        return source
 
 
 class FFmpegStreamBuilder:

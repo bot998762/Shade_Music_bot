@@ -76,12 +76,33 @@ class YouTubeService:
                 cookies_path,
                 os.path.join(os.getcwd(), cookies_path),
             ]
+            found: Optional[str] = None
             for candidate in candidates:
                 if os.path.isfile(candidate):
-                    self._cookies_path = candidate
-                    logger.info("YouTube: cookies.txt loaded from '{}'", candidate)
+                    found = candidate
                     break
-            if not self._cookies_path:
+
+            if found:
+                # /etc/secrets is read-only on Render — yt-dlp tries to write
+                # a lock file next to cookies.txt and crashes with EROFS.
+                # Copy to /tmp (writable) before passing to yt-dlp.
+                tmp_path = f"/tmp/{filename}"
+                try:
+                    import shutil
+                    shutil.copy2(found, tmp_path)
+                    self._cookies_path = tmp_path
+                    logger.info(
+                        "YouTube: cookies.txt copied to '{}' (source: '{}')",
+                        tmp_path, found,
+                    )
+                except Exception as copy_err:
+                    # Fall back to original path — may still work on some envs
+                    self._cookies_path = found
+                    logger.warning(
+                        "YouTube: could not copy cookies to /tmp ({}), using '{}' directly",
+                        copy_err, found,
+                    )
+            else:
                 logger.warning(
                     "YouTube: cookies.txt not found (checked: {}) — no auth",
                     ", ".join(candidates),
