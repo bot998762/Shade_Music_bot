@@ -245,3 +245,16 @@ class MusicEngine:
             await self._notify(chat_id, text)
         except Exception as exc:
             logger.debug("Could not send now-playing notification: {}", exc)
+
+
+def format_now_playing(track: "Track") -> str:
+    """
+    Shared helper — produces the Now Playing message text.
+    Imported by music.py handlers for consistent formatting.
+    """
+    return (
+        "🎵 **Now Playing**\n\n"
+        f"**{track.title}**\n"
+        f"⏱ {track.formatted_duration}  •  👤 {track.uploader}\n"
+        f"Requested by: {track.requested_by_name}"
+    )
