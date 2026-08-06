@@ -68,14 +68,22 @@ class YouTubeService:
     def __init__(self, cookies_path: Optional[str] = None) -> None:
         self._cookies_path: Optional[str] = None
         if cookies_path:
-            import os
-            if os.path.isfile(cookies_path):
-                self._cookies_path = cookies_path
-                logger.info("YouTube: cookies.txt loaded from '{}'", cookies_path)
-            else:
+            filename = os.path.basename(cookies_path)
+            # Render Secret Files are at /etc/secrets/<filename> — check first
+            candidates = [
+                f"/etc/secrets/{filename}",
+                cookies_path,
+                os.path.join(os.getcwd(), cookies_path),
+            ]
+            for candidate in candidates:
+                if os.path.isfile(candidate):
+                    self._cookies_path = candidate
+                    logger.info("YouTube: cookies.txt loaded from '{}'", candidate)
+                    break
+            if not self._cookies_path:
                 logger.warning(
-                    "YouTube: cookies_path='{}' not found — continuing without cookies.",
-                    cookies_path,
+                    "YouTube: cookies.txt not found (checked: {}) — no auth",
+                    ", ".join(candidates),
                 )
 
     @staticmethod
