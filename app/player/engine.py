@@ -3,28 +3,15 @@ app.player.engine
 ~~~~~~~~~~~~~~~~~
 MusicEngine — orchestrates search → queue → stream for every group chat.
 
-Stream URL strategy (py-tgcalls==2.3.3)
-----------------------------------------
-py-tgcalls 2.3.x has yt-dlp built in. MediaStream accepts YouTube watch
-URLs directly and handles extraction internally via its own yt-dlp call.
+Stream flow (py-tgcalls==2.3.3 + cookies)
+------------------------------------------
+1. YouTubeService.search(query) → Track(webpage_url, title, duration, ...)
+2. FFmpegStreamBuilder.build_from_youtube(webpage_url, cookies_path)
+   → MediaStream(url, AudioQuality.HIGH, IGNORE, ytdlp_parameters='--cookies ...')
+3. VoiceChatManager.play(chat_id, stream) → PyTgCalls → ntgcalls → audio
 
-We pass the webpage_url (youtube.com/watch?v=...) directly to MediaStream
-via FFmpegStreamBuilder.build_from_youtube(). This means:
-  • No separate yt-dlp pre-resolution step needed for YouTube URLs.
-  • No expiring pre-signed CDN URLs to manage.
-  • Library's own format selection handles PO tokens, signatures, etc.
-
-YouTubeService.search() still runs to get metadata (title, duration,
-thumbnail, uploader) for the queue display. But get_stream_url() is no
-longer called — we use the webpage_url stored on the Track directly.
-
-Design rules
-------------
-* No Telegram API calls inside the engine.
-* All errors are caught here; callers receive well-typed exceptions or None.
-* on_stream_end is iterative (while loop) — no recursion.
-* skip() sets VoiceChatManager.begin_skip() guard before change_stream().
-* _start_next() re-queues the track on join failure so it is not lost.
+Cookies are REQUIRED on Render server IPs. Without them, YouTube returns:
+"Sign in to confirm you're not a bot." and the stream fails silently.
 """
 
 from __future__ import annotations
@@ -41,7 +28,6 @@ from app.streaming.voice_chat import VoiceChatManager
 
 NotifyFn = Callable[[int, str], Awaitable[None]]
 
-# Max consecutive stream failures before giving up and leaving VC.
 _MAX_SKIP_RETRIES = 3
 
 
@@ -51,11 +37,13 @@ class MusicEngine:
 
     Parameters
     ----------
-    queue:   Shared QueueManager instance.
-    vc:      VoiceChatManager (already started).
-    yt:      YouTubeService for search (metadata only).
-    notify_fn: Optional async callable — sends "Now Playing" messages.
+    queue:        Shared QueueManager instance.
+    vc:           VoiceChatManager (already started).
+    yt:           YouTubeService for search (metadata only).
+    notify_fn:    Optional async callable — sends "Now Playing" messages.
     max_queue_size: Hard cap on upcoming tracks per chat.
+    cookies_path: Path to cookies.txt — passed to MediaStream via
+                  ytdlp_parameters so the internal yt-dlp can authenticate.
     """
 
     def __init__(
@@ -65,12 +53,14 @@ class MusicEngine:
         yt: YouTubeService,
         notify_fn: Optional[NotifyFn] = None,
         max_queue_size: int = 50,
+        cookies_path: Optional[str] = None,
     ) -> None:
         self._queue = queue
         self._vc = vc
         self._yt = yt
         self._notify = notify_fn
         self._max_queue = max_queue_size
+        self._cookies = cookies_path
         self._stream_end_locks: dict[int, asyncio.Lock] = {}
 
     # ── Public commands ───────────────────────────────────────────────────────
@@ -83,10 +73,9 @@ class MusicEngine:
         requested_by_name: str,
     ) -> Tuple[Track, bool]:
         """
-        Search YouTube and either start playback or enqueue the result.
-
+        Search YouTube and either start playback or enqueue.
         Returns (track, is_playing_now).
-        Raises ValueError (no results) or RuntimeError (queue full / VC join failed).
+        Raises ValueError (no results) or RuntimeError (queue full / join failed).
         """
         track = await self._yt.search(query, requested_by_id, requested_by_name)
         if track is None:
@@ -109,11 +98,7 @@ class MusicEngine:
             return track, False
 
     async def skip(self, chat_id: int) -> Optional[Track]:
-        """
-        Skip the current track and play the next one.
-
-        Returns the new current track, or None when the queue is empty.
-        """
+        """Skip current track. Returns new current track or None if queue empty."""
         if await self._queue.is_empty(chat_id):
             await self._leave_and_cleanup(chat_id)
             return None
@@ -123,14 +108,14 @@ class MusicEngine:
             await self._leave_and_cleanup(chat_id)
             return None
 
-        stream = FFmpegStreamBuilder.build_from_youtube(next_track.webpage_url)
+        stream = FFmpegStreamBuilder.build_from_youtube(
+            next_track.webpage_url, self._cookies
+        )
 
         self._vc.begin_skip(chat_id)
         try:
             changed = await self._vc.change_stream(chat_id, stream)
         finally:
-            # Delay clearing the skip guard — pytgcalls dispatches
-            # StreamAudioEnded asynchronously for the replaced track.
             async def _delayed_end_skip() -> None:
                 await asyncio.sleep(1.0)
                 self._vc.end_skip(chat_id)
@@ -145,18 +130,16 @@ class MusicEngine:
         return next_track
 
     async def stop(self, chat_id: int) -> None:
-        """Stop playback, clear the queue, and leave the voice chat."""
+        """Stop playback, clear queue, leave VC."""
         await self._queue.clear(chat_id)
         await self._leave_and_cleanup(chat_id)
 
     async def pause(self, chat_id: int) -> bool:
-        """Pause. Returns False when nothing is playing."""
         if not self._vc.is_active(chat_id):
             return False
         return await self._vc.pause(chat_id)
 
     async def resume(self, chat_id: int) -> bool:
-        """Resume. Returns False when not in a VC."""
         if not self._vc.is_active(chat_id):
             return False
         return await self._vc.resume(chat_id)
@@ -172,14 +155,10 @@ class MusicEngine:
     def is_active(self, chat_id: int) -> bool:
         return self._vc.is_active(chat_id)
 
-    # ── Stream-end callback (called by VoiceChatManager) ─────────────────────
+    # ── Stream-end callback ───────────────────────────────────────────────────
 
     async def on_stream_end(self, chat_id: int) -> None:
-        """
-        Invoked when a track finishes playing or VC is closed.
-        Auto-advances the queue. Iterative — no recursion.
-        Protected by a per-chat asyncio.Lock.
-        """
+        """Auto-advance queue when a track ends. Iterative, lock-protected."""
         if chat_id not in self._stream_end_locks:
             self._stream_end_locks[chat_id] = asyncio.Lock()
 
@@ -198,8 +177,9 @@ class MusicEngine:
                     await self._leave_and_cleanup(chat_id)
                     return
 
-                # Build stream — pass YouTube URL directly to the library.
-                stream = FFmpegStreamBuilder.build_from_youtube(next_track.webpage_url)
+                stream = FFmpegStreamBuilder.build_from_youtube(
+                    next_track.webpage_url, self._cookies
+                )
                 changed = await self._vc.change_stream(chat_id, stream)
 
                 if changed:
@@ -213,7 +193,7 @@ class MusicEngine:
                 else:
                     retries += 1
                     logger.warning(
-                        "change_stream failed for '{}' (attempt {}/{}) — chat_id={}",
+                        "change_stream failed for '{}' (attempt {}/{})  chat_id={}",
                         next_track.title, retries, _MAX_SKIP_RETRIES, chat_id,
                     )
 
@@ -226,24 +206,17 @@ class MusicEngine:
     # ── Private helpers ───────────────────────────────────────────────────────
 
     async def _start_next(self, chat_id: int) -> None:
-        """
-        Pop the queue head and start playback.
-
-        Passes the YouTube watch URL directly to MediaStream —
-        py-tgcalls 2.3.x handles yt-dlp extraction internally.
-
-        Raises RuntimeError if the voice chat cannot be joined.
-        """
+        """Pop queue head and start playback with cookies."""
         track = await self._queue.pop_next(chat_id)
         if track is None:
             return
 
-        # Pass YouTube URL directly — library's built-in yt-dlp handles it.
-        stream = FFmpegStreamBuilder.build_from_youtube(track.webpage_url)
+        stream = FFmpegStreamBuilder.build_from_youtube(
+            track.webpage_url, self._cookies
+        )
         joined = await self._vc.play(chat_id, stream)
 
         if not joined:
-            # Re-queue the track so it is not lost.
             await self._queue.prepend(chat_id, track)
             self._queue.set_current(chat_id, None)
             raise RuntimeError(
@@ -262,17 +235,13 @@ class MusicEngine:
     async def _send_now_playing(self, chat_id: int, track: Track) -> None:
         if self._notify is None:
             return
-        text = format_now_playing(track)
+        text = (
+            "🎵 **Now Playing**\n\n"
+            f"**{track.title}**\n"
+            f"⏱ {track.formatted_duration}  •  👤 {track.uploader}\n"
+            f"Requested by: {track.requested_by_name}"
+        )
         try:
             await self._notify(chat_id, text)
         except Exception as exc:
             logger.debug("Could not send now-playing notification: {}", exc)
-
-
-def format_now_playing(track: Track) -> str:
-    return (
-        "🎵 **Now Playing**\n\n"
-        f"**{track.title}**\n"
-        f"⏱ {track.formatted_duration}  •  👤 {track.uploader}\n"
-        f"Requested by: {track.requested_by_name}"
-    )

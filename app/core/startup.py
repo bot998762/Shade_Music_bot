@@ -182,6 +182,7 @@ class ApplicationLifecycle:
             yt=yt_service,
             notify_fn=_notify,
             max_queue_size=self._settings.max_queue_size,
+            cookies_path=self._settings.cookies_path,
         )
 
         # ── Wire stream-end callback (breaks the circular dep) ────────────
