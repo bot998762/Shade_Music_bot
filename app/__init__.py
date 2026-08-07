@@ -1,1 +1,1 @@
-"""ShadeMusicBot — Telegram Voice Chat Music Bot."""
+"""Core App Package"""
