@@ -2,10 +2,8 @@ import asyncio
 import logging
 import os
 import sys
-import traceback
 from aiohttp import web
 
-# Force unbuffered output so logs appear instantly on Render
 sys.stdout.reconfigure(line_buffering=True)
 
 logging.basicConfig(
@@ -20,7 +18,7 @@ async def health_check(request):
 
 async def start_web_server():
     port = int(os.getenv("PORT", os.getenv("APP_PORT", 8080)))
-    logger.info(f"Binding dummy web server to port {port}...")
+    logger.info(f"Starting Keep-Alive Web Server on port {port}...")
     app = web.Application()
     app.router.add_get("/", health_check)
     app.router.add_get("/health", health_check)
@@ -28,7 +26,7 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logger.info(f"Web server successfully bound to port {port}")
+    logger.info("Web Server successfully running!")
 
 async def main():
     logger.info("Starting Phase 1 Live Validation Environment...")
@@ -40,9 +38,7 @@ async def main():
         app_context = await initialize_app()
         await start_bot(app_context)
     except Exception as e:
-        logger.error(f"❌ CRITICAL RUNTIME ERROR: {str(e)}")
-        logger.error(traceback.format_exc())
-        # Keep process alive briefly so logs flush to Render
+        logger.error(f"❌ CRITICAL RUNTIME ERROR: {str(e)}", exc_info=True)
         await asyncio.sleep(5)
         sys.exit(1)
 
