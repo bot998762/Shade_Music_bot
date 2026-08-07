@@ -1,7 +1,16 @@
 import os
 import logging
 from pyrogram import Client
-from pytgcalls import PyTgCalls
+
+# Robust multi-version import handling for PyTgCalls
+try:
+    from pytgcalls import PyTgCalls
+except ImportError:
+    try:
+        from pytgcalls.pytgcalls import PyTgCalls
+    except ImportError:
+        from pytgcalls.client import PyTgCalls
+
 from app.playback.controller import PlaybackController
 from app.playback.state import StateManager
 from app.streaming.voice import VoiceChatManager
@@ -25,7 +34,7 @@ async def initialize_app():
     
     assistant = None
     if session_string:
-        logger.info("Initializing Assistant Client...")
+        logger.info("Assistant Session detected. Initializing Client...")
         assistant = Client("ShadeAssistant", api_id=int(api_id), api_hash=api_hash, session_string=session_string)
 
     call_py = PyTgCalls(assistant if assistant else bot)
