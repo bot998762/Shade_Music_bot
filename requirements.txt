@@ -1,7 +1,0 @@
-pyrogram==2.0.103
-py-tgcalls
-yt-dlp>=2024.03.10
-aiohttp>=3.9.0
-motor>=3.3.0
-pydantic>=2.0.0
-python-dotenv>=1.0.0
