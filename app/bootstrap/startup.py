@@ -12,20 +12,24 @@ from app.handlers.help import help_handler
 logger = logging.getLogger("Startup")
 
 async def initialize_app():
-    logger.info("Initializing clients and services...")
+    logger.info("Initializing Pyrogram & PyTgCalls Clients...")
+    
     api_id = os.getenv("API_ID")
     api_hash = os.getenv("API_HASH")
     bot_token = os.getenv("BOT_TOKEN")
     session_string = os.getenv("SESSION_STRING") or os.getenv("ASSISTANT_SESSION_STRING")
 
-    if not all([api_id, api_hash, bot_token]):
-        raise ValueError("Missing essential env vars: API_ID, API_HASH, or BOT_TOKEN")
+    if not api_id or not api_hash or not bot_token:
+        raise ValueError(f"Missing Essential Vars! API_ID={bool(api_id)}, API_HASH={bool(api_hash)}, BOT_TOKEN={bool(bot_token)}")
 
     bot = Client("ShadeMusicBot", api_id=int(api_id), api_hash=api_hash, bot_token=bot_token)
+    
     assistant = None
     if session_string:
-        logger.info("Found Assistant Session String. Initializing User Client...")
+        logger.info("Assistant Session String detected. Initializing User Client...")
         assistant = Client("ShadeAssistant", api_id=int(api_id), api_hash=api_hash, session_string=session_string)
+    else:
+        logger.warning("No ASSISTANT_SESSION_STRING provided! Running Bot-only mode.")
 
     call_py = PyTgCalls(assistant if assistant else bot)
     voice_mgr = VoiceChatManager()
