@@ -1,5 +1,5 @@
 services:
-  - type: worker
+  - type: web
     name: shade-music-bot-phase1
     env: docker
     autoDeploy: true
