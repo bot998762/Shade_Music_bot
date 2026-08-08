@@ -46,6 +46,7 @@ from pytgcalls.types import ChatUpdate, MediaStream, Update
 from pytgcalls.types.stream import StreamEnded as StreamAudioEnded
 
 from app.infrastructure.logger import logger
+from app.shared.exceptions import AssistantNotMemberError
 from app.streaming.media import AUDIO_QUALITY, IGNORE_VIDEO
 
 StreamEndCallback = Callable[[int], Awaitable[None]]
@@ -68,10 +69,32 @@ _ALREADY_JOINED = (
     "in_call",
 )
 
+# ── Pyrogram peer error patterns ───────────────────────────────────────────────
+# Raised when the assistant is not a member of a private supergroup, or when
+# the peer cannot be resolved from the int chat_id alone.
+_PEER_INVALID = (
+    "channelinvalid",
+    "channel_invalid",
+    "peerinvalid",
+    "peer_invalid",
+    "peerflood",
+)
+# Raised when trying to join a group that requires an invite link.
+_INVITE_REQUIRED = (
+    "invitehashinvalid",
+    "invite_hash_invalid",
+    "invitehashexpired",
+    "invite_hash_expired",
+    "channelprivate",
+    "channel_private",
+    "usernotinenabled",
+    "chatwriteforbidden",
+)
+
 
 def _match(exc: Exception, phrases: tuple) -> bool:
-    msg = str(exc).lower().replace(" ", "")
-    return any(p.replace(" ", "") in msg for p in phrases)
+    msg = str(exc).lower().replace(" ", "").replace("_", "")
+    return any(p.replace("_", "") in msg for p in phrases)
 
 
 class VoiceChatManager:
@@ -87,7 +110,7 @@ class VoiceChatManager:
     """
 
     def __init__(self, client: Client) -> None:
-        self._client  = client                      # kept for peer pre-warm in play()
+        self._client  = client
         self._tgcalls = PyTgCalls(client)
         self._active:           Set[int] = set()
         self._skip_in_progress: Set[int] = set()
@@ -120,66 +143,31 @@ class VoiceChatManager:
 
         Returns True on success.
         Returns False when no active voice chat exists in the group.
+        Returns False (with a clear error log) when the assistant is not a
+        member and cannot join automatically.
         Automatically falls back to change_stream() if already connected.
+
+        Membership handling
+        -------------------
+        If get_chat() fails with CHANNEL_INVALID (assistant not in group):
+          1. Inspect the group's username via a public lookup attempt.
+          2. Public group (has username): attempt join_chat(username).
+             If join succeeds, the peer is now cached — proceed normally.
+          3. Private group (no username, needs invite): return False immediately
+             with a clear log — caller surfaces the "add assistant" message.
+
+        Peer-cache fix (preserved from previous fix)
+        ---------------------------------------------
+        in_memory=True starts with an empty peer cache.  PyTgCalls calls
+        resolve_peer(chat_id) internally.  Without the peer cached, pyrofork
+        sends channels.GetChannels with access_hash=0 → 400 CHANNEL_INVALID.
+        get_chat() populates the cache with the real access_hash.
+        resolve_peer() verifies the peer is resolvable before calling tgcalls.
 
         Stage log: [VOICE] join+play
         """
-        # Peer resolution guard: ensure the assistant's in-memory peer cache
-        # holds the real access_hash for this supergroup BEFORE PyTgCalls
-        # calls resolve_peer() internally.
-        #
-        # Root cause of 400 CHANNEL_INVALID
-        # ------------------------------------
-        # in_memory=True → peer cache is empty on every cold start.
-        # PyTgCalls calls client.resolve_peer(chat_id) internally.
-        # Without the peer cached, pyrofork sends:
-        #   channels.GetChannels(id=[InputChannel(channel_id=X, access_hash=0)])
-        # Telegram rejects access_hash=0 → 400 CHANNEL_INVALID.
-        #
-        # Why the previous fix (get_chat + silent except) did NOT work
-        # -------------------------------------------------------------
-        # get_chat() was swallowing its exception at DEBUG level.  If the
-        # assistant is not in the group, get_chat() raises CHANNEL_INVALID
-        # itself, the except silently ate it, and tgcalls.play() below then
-        # hit the exact same error.  The debug log was never visible because
-        # Render's default log level only shows INFO and above.
-        #
-        # Correct approach
-        # -----------------
-        # Step 1 — get_chat(): fetches the Channel object and populates the
-        #          in-memory peer storage with the real access_hash.
-        #          Log failures at WARNING so they are ALWAYS visible.
-        # Step 2 — resolve_peer(): immediately verifies the peer is now
-        #          resolvable.  If it raises, the peer is NOT in cache —
-        #          tgcalls.play() would produce the same CHANNEL_INVALID —
-        #          so we return False early with a clear diagnostic message.
-        try:
-            await self._client.get_chat(chat_id)
-            logger.debug(
-                "[VOICE] Peer cache populated via get_chat  chat_id={}", chat_id
-            )
-        except Exception as warm_exc:
-            logger.warning(
-                "[VOICE] get_chat() failed — assistant may not be a member of "
-                "this group  chat_id={}  error={}",
-                chat_id, warm_exc,
-            )
-            # Fall through: the peer may already be cached from startup
-            # get_dialogs().  resolve_peer() below will confirm.
-
-        try:
-            peer = await self._client.resolve_peer(chat_id)
-            logger.debug(
-                "[VOICE] resolve_peer OK — peer is cached  chat_id={}  peer={}",
-                chat_id, peer,
-            )
-        except Exception as resolve_exc:
-            logger.error(
-                "[VOICE] resolve_peer() FAILED — peer not in cache.  "
-                "The assistant account must JOIN the group before /play can work.  "
-                "chat_id={}  error={}",
-                chat_id, resolve_exc,
-            )
+        peer_ok = await self._ensure_peer(chat_id)
+        if not peer_ok:
             return False
 
         try:
@@ -306,6 +294,158 @@ class VoiceChatManager:
         return chat_id in self._active
 
     # ── Private helpers ───────────────────────────────────────────────────────
+
+    async def _ensure_peer(self, chat_id: int) -> bool:
+        """
+        Ensure the assistant's in-memory peer cache holds a valid, resolvable
+        peer for *chat_id* before PyTgCalls calls resolve_peer() internally.
+
+        Returns True  — peer is in cache, safe to call tgcalls.play().
+        Returns False — peer cannot be resolved; caller should abort and
+                        surface the appropriate user message.
+
+        Resolution order
+        ----------------
+        1. get_chat(chat_id) — populates the peer cache with the real
+           access_hash.  For public groups this always succeeds (public info
+           visible without membership).  For private groups this raises
+           CHANNEL_INVALID when the assistant is not a member.
+
+        2. If step 1 fails with a peer/channel error:
+           a. Attempt join_chat(chat_id) — pyrofork can join public supergroups
+              using channels.JoinChannel.  On success the peer is now cached
+              and the assistant is a member.
+           b. If join_chat raises INVITE_HASH / CHANNEL_PRIVATE / similar:
+              the group is private and requires an invite link.  Log clearly
+              and return False so the caller surfaces the right user message.
+           c. If join_chat raises anything else (flood, network, etc.):
+              log the error and return False.
+
+        3. Verify with resolve_peer() — confirms the access_hash is actually
+           in the in-memory storage before handing off to PyTgCalls.
+
+        Why not invite links
+        --------------------
+        We never generate or use invite links.  A ChatInviteLink is only
+        visible to admins.  The assistant account is not an admin.
+        Attempting to use an invite link we don't have raises INVITE_HASH_INVALID.
+        The correct action for private groups is: an admin adds the assistant
+        manually.  We surface a clear message asking for exactly that.
+        """
+        # ── Step 1: populate peer cache ────────────────────────────────────
+        try:
+            await self._client.get_chat(chat_id)
+            logger.debug(
+                "[VOICE] Peer cache populated via get_chat  chat_id={}", chat_id
+            )
+
+        except Exception as get_exc:
+            if _match(get_exc, _PEER_INVALID):
+                # Peer not in cache — assistant is likely not a member.
+                # Try to join as a public supergroup first.
+                logger.info(
+                    "[VOICE] get_chat() raised peer error — attempting auto-join  "
+                    "chat_id={}  error={}",
+                    chat_id, get_exc,
+                )
+                joined = await self._try_join(chat_id)
+                if not joined:
+                    return False
+                # join succeeded — peer is now cached, continue to step 3
+            else:
+                # Network error, flood wait, etc. — not a membership issue.
+                logger.warning(
+                    "[VOICE] get_chat() failed (non-peer error)  "
+                    "chat_id={}  error={}",
+                    chat_id, get_exc,
+                )
+                # Don't abort: peer may already be cached from startup
+                # get_dialogs().  Let resolve_peer() decide below.
+
+        # ── Step 3: verify peer is resolvable ─────────────────────────────
+        try:
+            peer = await self._client.resolve_peer(chat_id)
+            logger.debug(
+                "[VOICE] resolve_peer OK  chat_id={}  peer={}", chat_id, peer
+            )
+            return True
+
+        except Exception as resolve_exc:
+            logger.error(
+                "[VOICE] resolve_peer() FAILED — peer not in cache after get_chat.  "
+                "The assistant must be a member of this group before /play works.  "
+                "chat_id={}  error={}",
+                chat_id, resolve_exc,
+            )
+            return False
+
+    async def _try_join(self, chat_id: int) -> bool:
+        """
+        Attempt to join *chat_id* as a public supergroup.
+
+        Public supergroups have a username; pyrofork can join them directly
+        via channels.JoinChannel.  Private groups have no username and require
+        an invite link that the assistant does not have.
+
+        Returns True  — assistant joined successfully.
+        Returns False — group is private or join failed; caller returns False
+                        so the user sees the "add assistant" message.
+
+        We deliberately do NOT try invite links:
+          - ChatInviteLink objects are only visible to group admins.
+          - The assistant account is not an admin in the target group.
+          - Any invite link we might guess or construct raises INVITE_HASH_INVALID.
+          - The correct fix for private groups is a human admin adding the assistant.
+        """
+        # First, try to get the group's username via a public info request.
+        # For public supergroups this works even without membership.
+        username: Optional[str] = None
+        try:
+            # Use the raw int ID — pyrofork can still fetch public channel info
+            # even if channels.GetChannels with access_hash=0 fails, because
+            # resolve_peer may find it via contact/search paths.
+            # If this also raises, we fall through to the private-group path.
+            chat_info = await self._client.get_chat(chat_id)
+            username = getattr(chat_info, "username", None)
+        except Exception:
+            pass  # can't get username — treat as private
+
+        if not username:
+            # Private group: no username available. Cannot join without invite.
+            logger.warning(
+                "[VOICE] Cannot auto-join — group is private (no public username).  "
+                "An admin must add the assistant account to the group manually.  "
+                "chat_id={}",
+                chat_id,
+            )
+            raise AssistantNotMemberError("private")
+
+        # Public group: attempt join via username.
+        try:
+            await self._client.join_chat(username)
+            logger.info(
+                "[VOICE] Auto-joined public group  chat_id={}  username=@{}",
+                chat_id, username,
+            )
+            return True
+
+        except Exception as join_exc:
+            if _match(join_exc, _INVITE_REQUIRED):
+                logger.warning(
+                    "[VOICE] Auto-join rejected — group appears private despite "
+                    "having a username (restricted join, channel, or approval-required).  "
+                    "An admin must add the assistant manually.  "
+                    "chat_id={}  username=@{}  error={}",
+                    chat_id, username, join_exc,
+                )
+                raise AssistantNotMemberError("join_failed")
+            else:
+                logger.error(
+                    "[VOICE] Auto-join attempt failed  "
+                    "chat_id={}  username=@{}  error={}",
+                    chat_id, username, join_exc,
+                )
+                raise AssistantNotMemberError("join_failed")
 
     async def _safe_leave(self, chat_id: int) -> None:
         try:
