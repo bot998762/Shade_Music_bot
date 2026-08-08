@@ -16,6 +16,18 @@ are different operations with different options, timeouts, and failure modes.
 Separating them keeps each module small and single-purpose, and avoids
 triggering full CDN resolution at search time (CDN URLs expire in ~6 h).
 
+Player client strategy
+----------------------
+The ``ios`` player client is used as the primary extraction client.
+YouTube's Innertube API has separate endpoints per client type.  The ``web``
+and ``android`` clients are heavily bot-detected on server IP ranges (Render,
+VPS, CI) and return "Requested format is not available" or "Sign in to
+confirm you're not a bot" for the vast majority of requests.  The ``ios``
+client uses a different API path that is not subject to the same detection
+and returns accessible format URLs for public videos without cookies.
+``android`` is retained as the secondary client for edge-case videos where
+``ios`` is blocked.
+
 Why Python-layer resolution beats MediaStream(ytdlp_parameters=...)
 -------------------------------------------------------------------
 ntgcalls 2.2.5 accepts ytdlp_parameters as a string but does NOT forward
@@ -54,9 +66,13 @@ _RESOLVE_EXECUTOR = ThreadPoolExecutor(
 )
 
 # ── yt-dlp options for full extraction ────────────────────────────────────────
-# NO format selector — android client returns different format IDs than web.
-# "bestaudio/best" fails on some responses with "Requested format is not available."
-# We fetch ALL formats and manually select the best audio-only stream.
+# Player client: ios is first because it uses a separate Innertube API endpoint
+# that is not bot-detected on server IP ranges.  android,web trigger YouTube's
+# bot detection on Render/VPS environments, returning "Requested format is not
+# available" or "Sign in to confirm you're not a bot" even for public videos.
+#
+# NO format selector — we fetch ALL formats and manually select the best
+# audio-only stream, so we are never bound to a format ID that may disappear.
 _STREAM_OPTS: Dict = {
     "quiet":         True,
     "no_warnings":   True,
@@ -68,7 +84,7 @@ _STREAM_OPTS: Dict = {
     # format intentionally omitted — manual selection in _sync_resolve()
     "extractor_args": {
         "youtube": {
-            "player_client": ["android", "web"],
+            "player_client": ["ios", "android"],
         }
     },
 }
@@ -139,7 +155,10 @@ class StreamResolver:
 
     def _sync_resolve(self, webpage_url: str) -> Optional[str]:
         """
-        Full yt-dlp extraction with cookies + android player_client.
+        Full yt-dlp extraction with ios player_client (+ android fallback).
+
+        ios client is used first because it is not bot-detected on server
+        environments.  android is the secondary client for edge cases.
 
         URL selection priority:
           1. Best audio-only format (vcodec == none) sorted by bitrate

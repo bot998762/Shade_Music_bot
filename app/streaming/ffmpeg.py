@@ -19,8 +19,11 @@ and passes it straight to FFmpeg — zero yt-dlp processing inside ntgcalls.
 
 Fallback path (build_from_youtube)
 -----------------------------------
-Called when StreamResolver fails.  Passes ytdlp_parameters to MediaStream.
-ntgcalls 2.2.5 may silently ignore --cookies but it is better than failing.
+Called only when StreamResolver fails (e.g. age-restricted or geo-blocked
+video where the ios client cannot obtain a format URL).  Passes
+ytdlp_parameters to MediaStream so ntgcalls runs yt-dlp internally using
+the same ios,android client priority as the primary resolver path.
+This ensures the primary and fallback share one extraction strategy.
 
 Stage log: [FFMPEG]
 """
@@ -70,28 +73,35 @@ class FFmpegStreamBuilder:
         """
         FALLBACK PATH — Build a MediaStream from a YouTube watch URL.
 
-        Called when StreamResolver fails or times out.
-        Passes ytdlp_parameters to MediaStream; ntgcalls 2.2.5 may or may
-        not honour them (known issue: --cookies is silently ignored), but
-        it is better than aborting playback entirely.
+        Called only when StreamResolver fails to obtain a direct CDN URL.
+        Passes ytdlp_parameters to MediaStream so ntgcalls runs yt-dlp
+        internally.  Uses the same ios,android player_client priority as
+        StreamResolver so both paths share one extraction strategy.
+
+        Cookies are appended when available (needed for age-restricted or
+        geo-blocked content); note that ntgcalls 2.2.5 may not forward
+        --cookies to its internal yt-dlp on all platforms.
 
         Stage log: [FFMPEG] fallback
         """
         abs_cookies = _resolve_cookies(cookies_path)
-        extractor_args = "--extractor-args youtube:player_client=android,web"
+        # Same client priority as StreamResolver: ios avoids bot detection on
+        # server IP ranges; android is the secondary fallback.
+        extractor_args = "--extractor-args youtube:player_client=ios,android"
 
         if abs_cookies:
             ytdlp_params = f"--cookies {abs_cookies} {extractor_args}"
             logger.warning(
-                "[FFMPEG] fallback — YouTube page URL + ytdlp_parameters  "
-                "cookies={}  url={}",
+                "[FFMPEG] fallback — YouTube page URL  "
+                "clients=ios,android  cookies={}  url={}",
                 abs_cookies,
                 webpage_url[:60],
             )
         else:
             ytdlp_params = extractor_args
             logger.warning(
-                "[FFMPEG] fallback — YouTube page URL, no cookies  url={}",
+                "[FFMPEG] fallback — YouTube page URL  "
+                "clients=ios,android  no cookies  url={}",
                 webpage_url[:60],
             )
 
