@@ -45,7 +45,7 @@ FROM python:3.12-slim AS production
 #   ffmpeg     — audio decoding / transcoding for pytgcalls / ntgcalls
 #   libssl3    — TgCrypto-pyrofork runtime crypto
 #   ca-certs   — HTTPS for MongoDB Atlas, Telegram API, YouTube CDN
-#   curl       — downloads the Deno installer; purged after use
+#   curl, unzip  — download and extract the Deno installer; both purged after use
 #
 # Since yt-dlp 2025.11.12, an external JavaScript runtime is required for
 # full YouTube support (n-signature and PO-token challenges).  Deno is the
@@ -60,8 +60,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libssl3 \
         ca-certificates \
         curl \
+        unzip \
     && curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh \
-    && apt-get purge -y --auto-remove curl \
+    && apt-get purge -y --auto-remove curl unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user — least-privilege principle.
