@@ -87,6 +87,7 @@ class VoiceChatManager:
     """
 
     def __init__(self, client: Client) -> None:
+        self._client  = client                      # kept for peer pre-warm in play()
         self._tgcalls = PyTgCalls(client)
         self._active:           Set[int] = set()
         self._skip_in_progress: Set[int] = set()
@@ -123,6 +124,30 @@ class VoiceChatManager:
 
         Stage log: [VOICE] join+play
         """
+        # Pre-warm the Pyrogram peer cache before PyTgCalls resolves the peer.
+        #
+        # Root cause of 400 CHANNEL_INVALID
+        # -----------------------------------
+        # The assistant uses in_memory=True — its peer cache is empty on every
+        # cold restart.  PyTgCalls internally calls client.resolve_peer(chat_id).
+        # If the peer is not cached, pyrofork falls back to:
+        #     channels.GetChannels(id=[InputChannel(channel_id=X, access_hash=0)])
+        # Telegram rejects access_hash=0 for private groups/supergroups with
+        #     400 CHANNEL_INVALID
+        #
+        # Fix: calling get_chat() first forces pyrofork to look up the channel
+        # and store the real access_hash in the in-memory peer cache.  Subsequent
+        # resolve_peer() calls (from PyTgCalls) find the peer in cache and
+        # succeed.  If get_chat() fails here, the assistant is not a member of
+        # the group — tgcalls.play() will also fail, which is the correct outcome.
+        try:
+            await self._client.get_chat(chat_id)
+        except Exception as warm_exc:
+            logger.debug(
+                "[VOICE] Peer pre-warm  chat_id={}  note={}",
+                chat_id, warm_exc,
+            )
+
         try:
             await self._tgcalls.play(chat_id, stream)
             self._active.add(chat_id)

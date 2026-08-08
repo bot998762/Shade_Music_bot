@@ -122,6 +122,23 @@ async def init_vc_client(
             "[STARTUP] Assistant client ready  {}  id={}",
             me.first_name, me.id,
         )
+
+        # Warm up the in-memory peer cache so tgcalls.play() can resolve
+        # group peers immediately on the first /play command.
+        #
+        # Root cause this prevents
+        # -------------------------
+        # in_memory=True starts each session with an empty peer cache.
+        # PyTgCalls calls resolve_peer(chat_id) when joining a VC.  If the
+        # peer is not cached, pyrofork calls:
+        #     channels.GetChannels(id=[InputChannel(channel_id=X, access_hash=0)])
+        # Telegram rejects access_hash=0 for private groups → 400 CHANNEL_INVALID.
+        #
+        # Fetching get_dialogs() forces Telegram to return all recent
+        # conversations with their real access hashes, populating the cache
+        # for every group the assistant is a member of.
+        await _warm_assistant_peer_cache(assistant)
+
         return assistant, assistant
 
     # No ASSISTANT_SESSION
@@ -139,6 +156,37 @@ async def init_vc_client(
         "[STARTUP] ╚══════════════════════════════════════════════════════════╝"
     )
     return bot_client, None
+
+
+async def _warm_assistant_peer_cache(client: Client) -> None:
+    """
+    Populate the in-memory Pyrogram peer cache by iterating recent dialogs.
+
+    With in_memory=True the peer cache is rebuilt from scratch on every
+    restart.  Pyrogram only adds peers to the cache as Telegram pushes
+    updates during the current session.  If a group has been quiet since
+    the bot last restarted, its peer (and access hash) will not be in cache
+    when PyTgCalls tries to join its voice chat.
+
+    Calling get_dialogs() issues messages.GetDialogs to Telegram, which
+    returns every recent conversation together with the Channel/Chat objects
+    that carry the real access hashes.  Pyrogram stores those into its
+    in-memory peer storage so subsequent resolve_peer() calls succeed
+    without any API round-trip.
+
+    This is called once at startup.  For groups the assistant joins after
+    startup, VoiceChatManager.play() performs an additional just-in-time
+    get_chat() warm-up before each tgcalls.play() call.
+    """
+    try:
+        count = 0
+        async for _ in client.get_dialogs():
+            count += 1
+        logger.info("[STARTUP] Assistant peer cache warmed ({} dialogs)", count)
+    except Exception as exc:
+        logger.warning(
+            "[STARTUP] Assistant peer cache warm-up failed (non-fatal): {}", exc
+        )
 
 
 # ── 4. Search ──────────────────────────────────────────────────────────────────
