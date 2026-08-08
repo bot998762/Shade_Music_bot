@@ -124,29 +124,63 @@ class VoiceChatManager:
 
         Stage log: [VOICE] join+play
         """
-        # Pre-warm the Pyrogram peer cache before PyTgCalls resolves the peer.
+        # Peer resolution guard: ensure the assistant's in-memory peer cache
+        # holds the real access_hash for this supergroup BEFORE PyTgCalls
+        # calls resolve_peer() internally.
         #
         # Root cause of 400 CHANNEL_INVALID
-        # -----------------------------------
-        # The assistant uses in_memory=True — its peer cache is empty on every
-        # cold restart.  PyTgCalls internally calls client.resolve_peer(chat_id).
-        # If the peer is not cached, pyrofork falls back to:
-        #     channels.GetChannels(id=[InputChannel(channel_id=X, access_hash=0)])
-        # Telegram rejects access_hash=0 for private groups/supergroups with
-        #     400 CHANNEL_INVALID
+        # ------------------------------------
+        # in_memory=True → peer cache is empty on every cold start.
+        # PyTgCalls calls client.resolve_peer(chat_id) internally.
+        # Without the peer cached, pyrofork sends:
+        #   channels.GetChannels(id=[InputChannel(channel_id=X, access_hash=0)])
+        # Telegram rejects access_hash=0 → 400 CHANNEL_INVALID.
         #
-        # Fix: calling get_chat() first forces pyrofork to look up the channel
-        # and store the real access_hash in the in-memory peer cache.  Subsequent
-        # resolve_peer() calls (from PyTgCalls) find the peer in cache and
-        # succeed.  If get_chat() fails here, the assistant is not a member of
-        # the group — tgcalls.play() will also fail, which is the correct outcome.
+        # Why the previous fix (get_chat + silent except) did NOT work
+        # -------------------------------------------------------------
+        # get_chat() was swallowing its exception at DEBUG level.  If the
+        # assistant is not in the group, get_chat() raises CHANNEL_INVALID
+        # itself, the except silently ate it, and tgcalls.play() below then
+        # hit the exact same error.  The debug log was never visible because
+        # Render's default log level only shows INFO and above.
+        #
+        # Correct approach
+        # -----------------
+        # Step 1 — get_chat(): fetches the Channel object and populates the
+        #          in-memory peer storage with the real access_hash.
+        #          Log failures at WARNING so they are ALWAYS visible.
+        # Step 2 — resolve_peer(): immediately verifies the peer is now
+        #          resolvable.  If it raises, the peer is NOT in cache —
+        #          tgcalls.play() would produce the same CHANNEL_INVALID —
+        #          so we return False early with a clear diagnostic message.
         try:
             await self._client.get_chat(chat_id)
-        except Exception as warm_exc:
             logger.debug(
-                "[VOICE] Peer pre-warm  chat_id={}  note={}",
+                "[VOICE] Peer cache populated via get_chat  chat_id={}", chat_id
+            )
+        except Exception as warm_exc:
+            logger.warning(
+                "[VOICE] get_chat() failed — assistant may not be a member of "
+                "this group  chat_id={}  error={}",
                 chat_id, warm_exc,
             )
+            # Fall through: the peer may already be cached from startup
+            # get_dialogs().  resolve_peer() below will confirm.
+
+        try:
+            peer = await self._client.resolve_peer(chat_id)
+            logger.debug(
+                "[VOICE] resolve_peer OK — peer is cached  chat_id={}  peer={}",
+                chat_id, peer,
+            )
+        except Exception as resolve_exc:
+            logger.error(
+                "[VOICE] resolve_peer() FAILED — peer not in cache.  "
+                "The assistant account must JOIN the group before /play can work.  "
+                "chat_id={}  error={}",
+                chat_id, resolve_exc,
+            )
+            return False
 
         try:
             await self._tgcalls.play(chat_id, stream)

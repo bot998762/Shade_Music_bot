@@ -182,7 +182,12 @@ async def _warm_assistant_peer_cache(client: Client) -> None:
         count = 0
         async for _ in client.get_dialogs():
             count += 1
-        logger.info("[STARTUP] Assistant peer cache warmed ({} dialogs)", count)
+        logger.info(
+            "[STARTUP] Assistant peer cache warmed ({} dialogs).  "
+            "If CHANNEL_INVALID still occurs, the assistant is NOT a member "
+            "of the target group — add it manually then redeploy.",
+            count,
+        )
     except Exception as exc:
         logger.warning(
             "[STARTUP] Assistant peer cache warm-up failed (non-fatal): {}", exc
