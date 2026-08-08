@@ -18,15 +18,27 @@ triggering full CDN resolution at search time (CDN URLs expire in ~6 h).
 
 Player client strategy
 ----------------------
-The ``ios`` player client is used as the primary extraction client.
-YouTube's Innertube API has separate endpoints per client type.  The ``web``
-and ``android`` clients are heavily bot-detected on server IP ranges (Render,
-VPS, CI) and return "Requested format is not available" or "Sign in to
-confirm you're not a bot" for the vast majority of requests.  The ``ios``
-client uses a different API path that is not subject to the same detection
-and returns accessible format URLs for public videos without cookies.
-``android`` is retained as the secondary client for edge-case videos where
-``ios`` is blocked.
+``tv_embedded`` (TVHTML5_SIMPLY_EMBEDDED_PLAYER) is the primary client.
+
+YouTube's Innertube API enforces Proof-of-Origin (PO) tokens on the
+``web``, ``ios``, and ``android`` clients when requests originate from
+data-centre IP ranges (Render, VPS, CI).  Without a PO token those
+clients return "Failed to extract any player response" or "Sign in to
+confirm you're not a bot" for every request, regardless of cookies.
+
+The ``tv_embedded`` client uses the YouTube embedded-player API endpoint
+which is exempt from PO token requirements for public videos.  It is
+the endpoint YouTube uses when a video is embedded on a third-party
+website — it returns muxed MP4 streams (formats 17/18/22) and does not
+require either PO tokens or authenticated cookies for public content.
+``ios`` and ``android`` are retained as secondary clients for content
+where the embed endpoint is restricted (age-gated or
+geo-blocked videos, which still require valid cookies).
+
+Format note: ``tv_embedded`` typically returns muxed (video+audio)
+streams rather than audio-only DASH.  The Priority 2 format selector
+in _sync_resolve() handles this correctly and picks the highest-bitrate
+muxed stream.  FFmpeg/ntgcalls extracts the audio track.
 
 Why Python-layer resolution beats MediaStream(ytdlp_parameters=...)
 -------------------------------------------------------------------
@@ -66,13 +78,17 @@ _RESOLVE_EXECUTOR = ThreadPoolExecutor(
 )
 
 # ── yt-dlp options for full extraction ────────────────────────────────────────
-# Player client: ios is first because it uses a separate Innertube API endpoint
-# that is not bot-detected on server IP ranges.  android,web trigger YouTube's
-# bot detection on Render/VPS environments, returning "Requested format is not
-# available" or "Sign in to confirm you're not a bot" even for public videos.
+# tv_embedded is first: the TVHTML5_SIMPLY_EMBEDDED_PLAYER endpoint is exempt
+# from YouTube's PO-token requirement on server IPs.  ios and android both
+# require PO tokens on Render/VPS — without them yt-dlp returns "Failed to
+# extract any player response" for every request.
+#
+# tv_embedded returns muxed MP4 streams (formats 17/18/22).  Our Priority 2
+# selector handles these correctly.  For public videos this resolves reliably
+# without any cookies.
 #
 # NO format selector — we fetch ALL formats and manually select the best
-# audio-only stream, so we are never bound to a format ID that may disappear.
+# audio stream, so we are never bound to a format ID that may disappear.
 _STREAM_OPTS: Dict = {
     "quiet":         True,
     "no_warnings":   True,
@@ -84,7 +100,7 @@ _STREAM_OPTS: Dict = {
     # format intentionally omitted — manual selection in _sync_resolve()
     "extractor_args": {
         "youtube": {
-            "player_client": ["ios", "android"],
+            "player_client": ["tv_embedded", "ios", "android"],
         }
     },
 }
@@ -155,14 +171,16 @@ class StreamResolver:
 
     def _sync_resolve(self, webpage_url: str) -> Optional[str]:
         """
-        Full yt-dlp extraction with ios player_client (+ android fallback).
+        Full yt-dlp extraction using tv_embedded as the primary client.
 
-        ios client is used first because it is not bot-detected on server
-        environments.  android is the secondary client for edge cases.
+        tv_embedded (TVHTML5_SIMPLY_EMBEDDED_PLAYER) is exempt from YouTube's
+        PO-token requirement on server IP ranges, making it the reliable primary
+        for public videos on Render/VPS.  ios and android are secondary fallbacks
+        for content where the embed endpoint is restricted.
 
         URL selection priority:
           1. Best audio-only format (vcodec == none) sorted by bitrate
-          2. Best muxed format that has audio
+          2. Best muxed format that has audio (tv_embedded returns these)
           3. info["url"] when yt-dlp returns a single-format response
         """
         opts = dict(_STREAM_OPTS)

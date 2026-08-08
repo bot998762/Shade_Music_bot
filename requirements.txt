@@ -27,9 +27,21 @@ py-tgcalls==2.3.3
 ntgcalls==2.2.5
 
 # ─── YouTube / Audio extraction ────────────────────────────────────────────────
-# Never pin yt-dlp — YouTube changes its API regularly; stale yt-dlp = broken.
-# Floor ensures modern extractor_args / player_client support.
-yt-dlp>=2025.1.0
+# Never pin yt-dlp — YouTube changes its Innertube API regularly; a stale
+# yt-dlp breaks extraction silently.  The floor is bumped whenever a Render
+# redeploy is needed to pick up a newer version (Render caches pip installs).
+#
+# Key milestones the floor must clear:
+#   2025.11.12 — JS runtime (Deno) support introduced; yt-dlp-ejs required
+#   2026.03.17 — youtube: Always respect webpage_client extractor-arg
+#                (makes our tv_embedded client selection reliable)
+#   2026.07.04 — Latest stable; Deno ≥ v2.3.0 required
+#
+# The [default] extra installs yt-dlp-ejs — the JavaScript bundle that
+# yt-dlp runs inside Deno to solve YouTube's n-signature and PO-token
+# challenges.  Without it, YouTube extraction falls back to a deprecated
+# limited mode and will eventually stop working entirely.
+yt-dlp[default]>=2026.07.04
 
 # ─── Database ──────────────────────────────────────────────────────────────────
 motor==3.4.0

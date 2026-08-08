@@ -20,10 +20,10 @@ and passes it straight to FFmpeg — zero yt-dlp processing inside ntgcalls.
 Fallback path (build_from_youtube)
 -----------------------------------
 Called only when StreamResolver fails (e.g. age-restricted or geo-blocked
-video where the ios client cannot obtain a format URL).  Passes
-ytdlp_parameters to MediaStream so ntgcalls runs yt-dlp internally using
-the same ios,android client priority as the primary resolver path.
-This ensures the primary and fallback share one extraction strategy.
+video where even tv_embedded cannot obtain a URL without authentication).
+Passes ytdlp_parameters to MediaStream so ntgcalls runs yt-dlp internally
+with the same tv_embedded,ios,android client priority as the primary path.
+For these videos, valid cookies from a logged-in Google account are required.
 
 Stage log: [FFMPEG]
 """
@@ -73,27 +73,24 @@ class FFmpegStreamBuilder:
         """
         FALLBACK PATH — Build a MediaStream from a YouTube watch URL.
 
-        Called only when StreamResolver fails to obtain a direct CDN URL.
-        Passes ytdlp_parameters to MediaStream so ntgcalls runs yt-dlp
-        internally.  Uses the same ios,android player_client priority as
-        StreamResolver so both paths share one extraction strategy.
-
-        Cookies are appended when available (needed for age-restricted or
-        geo-blocked content); note that ntgcalls 2.2.5 may not forward
-        --cookies to its internal yt-dlp on all platforms.
+        Reached only when StreamResolver failed to resolve a direct CDN URL,
+        which at this point means the video requires authentication (age-gated,
+        geo-blocked, or private).  Uses the same tv_embedded→ios→android client
+        priority as StreamResolver.  Valid Google account cookies are required
+        for these videos; without them this path will also fail.
 
         Stage log: [FFMPEG] fallback
         """
         abs_cookies = _resolve_cookies(cookies_path)
-        # Same client priority as StreamResolver: ios avoids bot detection on
-        # server IP ranges; android is the secondary fallback.
-        extractor_args = "--extractor-args youtube:player_client=ios,android"
+        # Matches StreamResolver client priority: tv_embedded is exempt from
+        # PO-token requirements; ios and android as secondary fallbacks.
+        extractor_args = "--extractor-args youtube:player_client=tv_embedded,ios,android"
 
         if abs_cookies:
             ytdlp_params = f"--cookies {abs_cookies} {extractor_args}"
             logger.warning(
                 "[FFMPEG] fallback — YouTube page URL  "
-                "clients=ios,android  cookies={}  url={}",
+                "clients=tv_embedded,ios,android  cookies={}  url={}",
                 abs_cookies,
                 webpage_url[:60],
             )
@@ -101,7 +98,7 @@ class FFmpegStreamBuilder:
             ytdlp_params = extractor_args
             logger.warning(
                 "[FFMPEG] fallback — YouTube page URL  "
-                "clients=ios,android  no cookies  url={}",
+                "clients=tv_embedded,ios,android  no cookies  url={}",
                 webpage_url[:60],
             )
 

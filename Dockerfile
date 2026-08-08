@@ -40,14 +40,28 @@ RUN pip install \
 # ── Stage 2: production image ─────────────────────────────────────────────────
 FROM python:3.12-slim AS production
 
-# Runtime dependencies:
+# Runtime dependencies + Deno (JS runtime required by yt-dlp for YouTube):
+#
 #   ffmpeg     — audio decoding / transcoding for pytgcalls / ntgcalls
 #   libssl3    — TgCrypto-pyrofork runtime crypto
 #   ca-certs   — HTTPS for MongoDB Atlas, Telegram API, YouTube CDN
+#   curl       — downloads the Deno installer; purged after use
+#
+# Since yt-dlp 2025.11.12, an external JavaScript runtime is required for
+# full YouTube support (n-signature and PO-token challenges).  Deno is the
+# default and recommended runtime; yt-dlp auto-detects it at
+# /usr/local/bin/deno — no yt-dlp config changes are needed.
+#
+# DENO_INSTALL=/usr/local  → binary lands at /usr/local/bin/deno (on PATH).
+# Minimum Deno for yt-dlp 2026.x: v2.3.0.  The installer fetches latest,
+# which is always ≥ 2.3.0 and backwards-compatible with yt-dlp's usage.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         libssl3 \
         ca-certificates \
+        curl \
+    && curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh \
+    && apt-get purge -y --auto-remove curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user — least-privilege principle.
