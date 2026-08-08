@@ -18,27 +18,32 @@ triggering full CDN resolution at search time (CDN URLs expire in ~6 h).
 
 Player client strategy
 ----------------------
-``tv_embedded`` (TVHTML5_SIMPLY_EMBEDDED_PLAYER) is the primary client.
+``mweb`` (YouTube Mobile Web) is the primary client.
 
-YouTube's Innertube API enforces Proof-of-Origin (PO) tokens on the
-``web``, ``ios``, and ``android`` clients when requests originate from
-data-centre IP ranges (Render, VPS, CI).  Without a PO token those
-clients return "Failed to extract any player response" or "Sign in to
-confirm you're not a bot" for every request, regardless of cookies.
+Since yt-dlp 2025.11.12, YouTube enforces Proof-of-Origin (PO) tokens
+for all Innertube clients when requests originate from data-centre IP
+ranges (Render, VPS, CI).  This now includes ``tv_embedded``
+(TVHTML5_SIMPLY_EMBEDDED_PLAYER), which was previously exempt but is
+no longer reliable from server IPs as of mid-2026.
 
-The ``tv_embedded`` client uses the YouTube embedded-player API endpoint
-which is exempt from PO token requirements for public videos.  It is
-the endpoint YouTube uses when a video is embedded on a third-party
-website — it returns muxed MP4 streams (formats 17/18/22) and does not
-require either PO tokens or authenticated cookies for public content.
-``ios`` and ``android`` are retained as secondary clients for content
-where the embed endpoint is restricted (age-gated or
-geo-blocked videos, which still require valid cookies).
+``mweb`` and ``web`` are the correct primary clients because:
+  - yt-dlp automatically uses Deno + yt-dlp-ejs to generate PO tokens
+    for these clients when Deno is on PATH (which it is — installed to
+    /usr/local/bin/deno in our Dockerfile).
+  - No explicit PO-token configuration is needed; yt-dlp handles it.
+  - ``mweb`` (mobile web) typically faces less aggressive bot detection
+    from server IPs than the desktop ``web`` client.
+  - ``tv_embedded`` is retained as a tertiary fallback for edge cases
+    where the embed API still responds correctly.
 
-Format note: ``tv_embedded`` typically returns muxed (video+audio)
-streams rather than audio-only DASH.  The Priority 2 format selector
-in _sync_resolve() handles this correctly and picks the highest-bitrate
-muxed stream.  FFmpeg/ntgcalls extracts the audio track.
+``ios`` and ``android`` are removed: both require PO tokens on server
+IPs and yt-dlp does not auto-generate PO tokens for native app clients,
+so they always fail from Render.
+
+Format note: ``mweb`` returns muxed or DASH streams depending on the
+video.  Priority 1 (audio-only) handles DASH; Priority 2 (muxed with
+audio) handles muxed.  FFmpeg/ntgcalls extracts the audio track either
+way.
 
 Why Python-layer resolution beats MediaStream(ytdlp_parameters=...)
 -------------------------------------------------------------------
@@ -78,14 +83,20 @@ _RESOLVE_EXECUTOR = ThreadPoolExecutor(
 )
 
 # ── yt-dlp options for full extraction ────────────────────────────────────────
-# tv_embedded is first: the TVHTML5_SIMPLY_EMBEDDED_PLAYER endpoint is exempt
-# from YouTube's PO-token requirement on server IPs.  ios and android both
-# require PO tokens on Render/VPS — without them yt-dlp returns "Failed to
-# extract any player response" for every request.
+# mweb is first: YouTube Mobile Web client.  When Deno is on PATH and
+# yt-dlp-ejs is installed (both are true in our Docker image), yt-dlp
+# automatically generates a PO token via Deno for this client.  This is
+# the correct bypass for Render's data-centre IP range as of yt-dlp 2026.x.
 #
-# tv_embedded returns muxed MP4 streams (formats 17/18/22).  Our Priority 2
-# selector handles these correctly.  For public videos this resolves reliably
-# without any cookies.
+# web is second: standard desktop client.  Same Deno/PO-token generation
+# path as mweb; returns DASH audio-only streams (Priority 1 in _sync_resolve).
+#
+# tv_embedded is third: the embedded-player endpoint.  Previously exempt from
+# PO tokens but now blocked from many data-centre IPs.  Retained as a
+# last-resort fallback for edge cases where it still responds correctly.
+#
+# ios and android are REMOVED: they require PO tokens but yt-dlp does not
+# auto-generate PO tokens for native app clients — they always fail on Render.
 #
 # NO format selector — we fetch ALL formats and manually select the best
 # audio stream, so we are never bound to a format ID that may disappear.
@@ -100,7 +111,7 @@ _STREAM_OPTS: Dict = {
     # format intentionally omitted — manual selection in _sync_resolve()
     "extractor_args": {
         "youtube": {
-            "player_client": ["tv_embedded", "ios", "android"],
+            "player_client": ["mweb", "web", "tv_embedded"],
         }
     },
 }
@@ -171,12 +182,12 @@ class StreamResolver:
 
     def _sync_resolve(self, webpage_url: str) -> Optional[str]:
         """
-        Full yt-dlp extraction using tv_embedded as the primary client.
+        Full yt-dlp extraction using mweb as the primary client.
 
-        tv_embedded (TVHTML5_SIMPLY_EMBEDDED_PLAYER) is exempt from YouTube's
-        PO-token requirement on server IP ranges, making it the reliable primary
-        for public videos on Render/VPS.  ios and android are secondary fallbacks
-        for content where the embed endpoint is restricted.
+        mweb (YouTube Mobile Web) triggers yt-dlp's automatic PO-token
+        generation via Deno + yt-dlp-ejs, which is the correct bypass for
+        Render's data-centre IP range.  web is the secondary client using
+        the same PO-token path.  tv_embedded is a last-resort fallback.
 
         URL selection priority:
           1. Best audio-only format (vcodec == none) sorted by bitrate
