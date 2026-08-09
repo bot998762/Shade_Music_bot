@@ -207,10 +207,24 @@ def init_search(settings: Settings) -> tuple[YouTubeSearch, StreamResolver]:
 
 # ── 5. Streaming ───────────────────────────────────────────────────────────────
 
-async def init_voice_chat(vc_client: Client) -> VoiceChatManager:
-    """Start the VoiceChatManager (PyTgCalls engine)."""
+async def init_voice_chat(
+    vc_client: Client,
+    bot_client: Optional[Client] = None,
+) -> VoiceChatManager:
+    """Start the VoiceChatManager (PyTgCalls engine).
+
+    Parameters
+    ----------
+    vc_client:
+        The Pyrogram user/assistant client that PyTgCalls uses to join VCs.
+    bot_client:
+        The Pyrogram bot client. Passed to VoiceChatManager so it can look up
+        a group's public username when the assistant needs to auto-join a group
+        it has never been in.  The bot is always a member of the group (it
+        received /play), so it can always resolve the group's info.
+    """
     logger.info("[STARTUP] Starting VoiceChatManager (PyTgCalls)...")
-    voice = VoiceChatManager(vc_client)
+    voice = VoiceChatManager(vc_client, bot_client=bot_client)
     await voice.start()
     logger.info("[STARTUP] VoiceChatManager ready")
     return voice

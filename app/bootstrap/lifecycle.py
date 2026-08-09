@@ -93,7 +93,7 @@ class ApplicationLifecycle:
         self._search, self._resolver = _startup.init_search(self._settings)
 
         # 5. Voice chat manager
-        self._voice = await _startup.init_voice_chat(vc_client)
+        self._voice = await _startup.init_voice_chat(vc_client, bot_client=self.bot_client)
 
         # 6. Session + state managers
         self._session, self._state = _startup.init_session_and_state()

@@ -15,7 +15,24 @@ Primary path (build_from_url)
 ------------------------------
 StreamResolver resolved the CDN URL in the Python yt-dlp layer where
 cookies are correctly applied.  ntgcalls receives a direct https://... URL
-and passes it straight to FFmpeg — zero yt-dlp processing inside ntgcalls.
+and passes it to FFmpeg with reconnect flags so transient CDN TCP drops
+do not abort the stream.
+
+FFmpeg reconnect flags
+----------------------
+YouTube CDN (googlevideo.com) URLs are valid for ~6 hours but the underlying
+TCP connection can be interrupted on Render's infrastructure (NAT rebind,
+CDN load-balancer failover).  Without reconnect flags, a single TCP hiccup
+causes FFmpeg to EOF immediately → ntgcalls fires StreamEnded prematurely →
+the song appears to end after a few seconds or mid-track.
+
+The three flags used:
+  -reconnect 1              Enable reconnect on disconnect
+  -reconnect_streamed 1     Also reconnect for streamed (non-seekable) sources
+  -reconnect_delay_max 5    Cap reconnect back-off at 5 s (avoids long hangs)
+
+These are passed via MediaStream(ffmpeg_parameters=...) which py-tgcalls 2.x
+forwards to the ntgcalls FFmpeg invocation as input options (before -i).
 
 Fallback path (build_from_youtube)
 -----------------------------------
@@ -39,6 +56,16 @@ from app.infrastructure.logger import logger
 from app.shared.constants import COOKIES_SECRETS_DIR, COOKIES_TMP_DIR
 from app.streaming.media import AUDIO_QUALITY, IGNORE_VIDEO, MediaStream
 
+# ── FFmpeg reconnect flags for direct CDN URLs ────────────────────────────────
+# Applied to the primary path only.
+# These are positional input options prepended before -i <url> by FFmpeg.
+# Stable across FFmpeg 4.x and 5.x (the versions available in Debian/Ubuntu apt).
+_RECONNECT_FLAGS = (
+    "-reconnect 1 "
+    "-reconnect_streamed 1 "
+    "-reconnect_delay_max 5"
+)
+
 
 class FFmpegStreamBuilder:
     """
@@ -53,7 +80,9 @@ class FFmpegStreamBuilder:
         PRIMARY PATH — Build a MediaStream from a pre-resolved direct CDN URL.
 
         The URL is a direct audio stream (e.g. rr*.googlevideo.com/...).
-        ntgcalls passes it straight to FFmpeg with zero yt-dlp invocation.
+        ntgcalls passes it to FFmpeg with reconnect flags so transient
+        CDN TCP disconnects do not abort the stream mid-track.
+
         No cookies or extractor-args needed here — auth already happened in
         StreamResolver which produced the direct URL.
 
@@ -64,6 +93,7 @@ class FFmpegStreamBuilder:
             direct_url,
             AUDIO_QUALITY,
             video_flags=IGNORE_VIDEO,
+            ffmpeg_parameters=_RECONNECT_FLAGS,
         )
 
     @staticmethod

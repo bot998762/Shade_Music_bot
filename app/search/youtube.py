@@ -63,7 +63,7 @@ _SEARCH_OPTS: Dict = {
     "retries":        2,
     "extractor_args": {
         "youtube": {
-            "player_client": ["android", "web"],
+            "player_client": ["mweb", "web"],
         }
     },
 }

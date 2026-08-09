@@ -32,6 +32,21 @@ Exception routing
 DO NOT import from pytgcalls.exceptions — class names change across minor
 versions. Route exceptions by inspecting message strings (stable across 2.x).
 
+Public-group auto-join
+----------------------
+The assistant account starts with an empty peer cache (in_memory=True).
+For a group the assistant has never joined, get_chat(numeric_id) raises
+CHANNEL_INVALID because the access_hash is unknown.
+
+Resolution flow:
+  1. try get_chat(chat_id) via assistant — succeeds if already a member.
+  2. On failure: use the BOT client (always a member, received the /play)
+     to look up the group via get_chat(chat_id) — bot is always in the group.
+  3. If the group has a username (public): assistant.join_chat(username).
+  4. After join: assistant.get_chat(chat_id) to populate peer cache.
+  5. If no username (private): return False with a clear error logged.
+  6. If join fails: return False (no broken VC state, no retry loop).
+
 Stage log: [VOICE]
 """
 
@@ -40,6 +55,7 @@ from __future__ import annotations
 from typing import Awaitable, Callable, Optional, Set
 
 from pyrogram import Client
+from pyrogram.errors import UserAlreadyParticipant
 from pytgcalls import PyTgCalls
 from pytgcalls import filters as fl
 from pytgcalls.types import ChatUpdate, MediaStream, Update
@@ -84,11 +100,17 @@ class VoiceChatManager:
         A started Pyrogram Client (user assistant account).
         Bot accounts cannot produce audio in Telegram voice chats — always
         use a real user account via ASSISTANT_SESSION.
+    bot_client:
+        Optional started Pyrogram Client (bot account).
+        Used ONLY for group info lookup during auto-join.
+        The bot is always a member of the group (it received /play), so it
+        can resolve a group's public username even when the assistant cannot.
     """
 
-    def __init__(self, client: Client) -> None:
-        self._client  = client                      # kept for peer pre-warm in play()
-        self._tgcalls = PyTgCalls(client)
+    def __init__(self, client: Client, bot_client: Optional[Client] = None) -> None:
+        self._client    = client                    # assistant (VC account)
+        self._bot       = bot_client                # bot (info lookup only)
+        self._tgcalls   = PyTgCalls(client)
         self._active:           Set[int] = set()
         self._skip_in_progress: Set[int] = set()
         self._on_stream_end:    Optional[StreamEndCallback] = None
@@ -116,72 +138,70 @@ class VoiceChatManager:
 
     async def play(self, chat_id: int, stream: MediaStream) -> bool:
         """
-        Join the voice chat and begin streaming.
+        Ensure assistant membership, join the voice chat, and begin streaming.
 
         Returns True on success.
-        Returns False when no active voice chat exists in the group.
-        Automatically falls back to change_stream() if already connected.
+        Returns False when no active voice chat exists or auto-join is not possible.
+
+        Membership flow
+        ---------------
+        Case 1 — Already a member:
+            get_chat() succeeds → resolve_peer() OK → tgcalls.play()
+
+        Case 2 — Not a member, public group (has username):
+            get_chat(via assistant) fails →
+            bot_client.get_chat() to get username →
+            assistant.join_chat(username) →
+            assistant.get_chat() to warm peer cache →
+            resolve_peer() → tgcalls.play()
+
+        Case 3 — Not a member, private group (no username):
+            Logged as ERROR. Returns False.
+            Bot replies: ask an admin to add the assistant.
+
+        Case 4 — join_chat() fails:
+            Logged as ERROR. Returns False. No broken VC state.
 
         Stage log: [VOICE] join+play
         """
-        # Peer resolution guard: ensure the assistant's in-memory peer cache
-        # holds the real access_hash for this supergroup BEFORE PyTgCalls
-        # calls resolve_peer() internally.
-        #
-        # Root cause of 400 CHANNEL_INVALID
-        # ------------------------------------
-        # in_memory=True → peer cache is empty on every cold start.
-        # PyTgCalls calls client.resolve_peer(chat_id) internally.
-        # Without the peer cached, pyrofork sends:
-        #   channels.GetChannels(id=[InputChannel(channel_id=X, access_hash=0)])
-        # Telegram rejects access_hash=0 → 400 CHANNEL_INVALID.
-        #
-        # Why the previous fix (get_chat + silent except) did NOT work
-        # -------------------------------------------------------------
-        # get_chat() was swallowing its exception at DEBUG level.  If the
-        # assistant is not in the group, get_chat() raises CHANNEL_INVALID
-        # itself, the except silently ate it, and tgcalls.play() below then
-        # hit the exact same error.  The debug log was never visible because
-        # Render's default log level only shows INFO and above.
-        #
-        # Correct approach
-        # -----------------
-        # Step 1 — get_chat(): fetches the Channel object and populates the
-        #          in-memory peer storage with the real access_hash.
-        #          Log failures at WARNING so they are ALWAYS visible.
-        # Step 2 — resolve_peer(): immediately verifies the peer is now
-        #          resolvable.  If it raises, the peer is NOT in cache —
-        #          tgcalls.play() would produce the same CHANNEL_INVALID —
-        #          so we return False early with a clear diagnostic message.
-        try:
-            await self._client.get_chat(chat_id)
-            logger.debug(
-                "[VOICE] Peer cache populated via get_chat  chat_id={}", chat_id
-            )
-        except Exception as warm_exc:
-            logger.warning(
-                "[VOICE] get_chat() failed — assistant may not be a member of "
-                "this group  chat_id={}  error={}",
-                chat_id, warm_exc,
-            )
-            # Fall through: the peer may already be cached from startup
-            # get_dialogs().  resolve_peer() below will confirm.
+        # ── Step 1: Try to populate peer cache via assistant ───────────────
+        already_member = await self._ensure_peer_cached(chat_id)
 
+        if not already_member:
+            # ── Step 2: Assistant is NOT in the group. Try auto-join. ─────
+            joined = await self._try_auto_join(chat_id)
+            if not joined:
+                return False
+
+            # ── Step 3: Re-warm peer cache after joining ───────────────────
+            try:
+                await self._client.get_chat(chat_id)
+                logger.debug(
+                    "[VOICE] Peer cache warmed after join  chat_id={}", chat_id
+                )
+            except Exception as exc:
+                logger.error(
+                    "[VOICE] get_chat() failed after join — cannot resolve peer  "
+                    "chat_id={}  error={}",
+                    chat_id, exc,
+                )
+                return False
+
+        # ── Step 4: Verify peer is resolvable ─────────────────────────────
         try:
             peer = await self._client.resolve_peer(chat_id)
             logger.debug(
-                "[VOICE] resolve_peer OK — peer is cached  chat_id={}  peer={}",
-                chat_id, peer,
+                "[VOICE] resolve_peer OK  chat_id={}  peer={}", chat_id, peer,
             )
         except Exception as resolve_exc:
             logger.error(
-                "[VOICE] resolve_peer() FAILED — peer not in cache.  "
-                "The assistant account must JOIN the group before /play can work.  "
+                "[VOICE] resolve_peer() FAILED after membership check — "
                 "chat_id={}  error={}",
                 chat_id, resolve_exc,
             )
             return False
 
+        # ── Step 5: Join VC and start stream ──────────────────────────────
         try:
             await self._tgcalls.play(chat_id, stream)
             self._active.add(chat_id)
@@ -304,6 +324,97 @@ class VoiceChatManager:
     def is_active(self, chat_id: int) -> bool:
         """Return True when the bot is streaming in this chat."""
         return chat_id in self._active
+
+    # ── Private: membership helpers ───────────────────────────────────────────
+
+    async def _ensure_peer_cached(self, chat_id: int) -> bool:
+        """
+        Attempt to populate the assistant's in-memory peer cache.
+
+        Returns True  — assistant is (or was already) a member; peer cached.
+        Returns False — assistant is NOT a member of this chat.
+
+        A successful get_chat() is the definitive signal that the assistant
+        is a member, because Telegram only returns full channel info to members.
+        """
+        try:
+            await self._client.get_chat(chat_id)
+            logger.debug(
+                "[VOICE] Peer cache OK (assistant is member)  chat_id={}", chat_id
+            )
+            return True
+        except Exception as exc:
+            logger.info(
+                "[VOICE] Assistant is not a member of chat_id={}  "
+                "(get_chat error: {}) — attempting auto-join",
+                chat_id, exc,
+            )
+            return False
+
+    async def _try_auto_join(self, chat_id: int) -> bool:
+        """
+        Attempt to auto-join a public group using the bot client for lookup.
+
+        Flow:
+          1. Use bot_client.get_chat() to learn the group's username.
+             (The bot always knows the group — it received the /play command.)
+          2. If the group has a username → assistant.join_chat(username).
+          3. If no username (private group) → log + return False.
+          4. join_chat raises → log + return False.
+
+        Returns True when the assistant successfully joined.
+        Returns False on any failure — caller will return False to controller,
+        which raises VoiceChatError with a clear user-facing message.
+        """
+        # ── Get group info via bot client ──────────────────────────────────
+        info_client = self._bot if self._bot is not None else self._client
+
+        try:
+            chat = await info_client.get_chat(chat_id)
+        except Exception as exc:
+            logger.error(
+                "[VOICE] Could not fetch group info for auto-join  "
+                "chat_id={}  error={}",
+                chat_id, exc,
+            )
+            return False
+
+        username: Optional[str] = getattr(chat, "username", None)
+
+        if not username:
+            # Private group — cannot auto-join without an invite link.
+            logger.error(
+                "[VOICE] Cannot auto-join — group is PRIVATE (no username).  "
+                "An admin must add the assistant account to chat_id={} manually.",
+                chat_id,
+            )
+            return False
+
+        # ── Attempt join via public username ───────────────────────────────
+        logger.info(
+            "[VOICE] Joining PUBLIC group @{}  chat_id={}", username, chat_id
+        )
+        try:
+            await self._client.join_chat(username)
+            logger.info(
+                "[VOICE] Assistant joined @{}  chat_id={}", username, chat_id
+            )
+            return True
+
+        except UserAlreadyParticipant:
+            # Race condition: assistant joined between our check and join attempt.
+            logger.debug(
+                "[VOICE] Assistant was already in group @{}  chat_id={}",
+                username, chat_id,
+            )
+            return True
+
+        except Exception as exc:
+            logger.error(
+                "[VOICE] join_chat(@{}) failed  chat_id={}  error={}",
+                username, chat_id, exc,
+            )
+            return False
 
     # ── Private helpers ───────────────────────────────────────────────────────
 

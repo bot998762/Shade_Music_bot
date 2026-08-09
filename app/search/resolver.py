@@ -106,8 +106,8 @@ _STREAM_OPTS: Dict = {
     "noplaylist":    True,
     "skip_download": True,
     "geo_bypass":    True,
-    "socket_timeout": 25,
-    "retries":       3,
+    "socket_timeout": 15,
+    "retries":       2,
     # format intentionally omitted — manual selection in _sync_resolve()
     "extractor_args": {
         "youtube": {
