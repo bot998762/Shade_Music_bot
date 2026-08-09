@@ -44,7 +44,7 @@ Resolution flow:
      to look up the group via get_chat(chat_id) — bot is always in the group.
   3. If the group has a username (public): assistant.join_chat(username).
   4. After join: assistant.get_chat(chat_id) to populate peer cache.
-  5. If no username (private): return False with a clear error logged.
+  5. If no username (private): raise PrivateGroupError (caught by handler).
   6. If join fails: return False (no broken VC state, no retry loop).
 
 Stage log: [VOICE]
@@ -62,6 +62,7 @@ from pytgcalls.types import ChatUpdate, MediaStream, Update
 from pytgcalls.types.stream import StreamEnded as StreamAudioEnded
 
 from app.infrastructure.logger import logger
+from app.shared.exceptions import PrivateGroupError
 from app.streaming.media import AUDIO_QUALITY, IGNORE_VIDEO
 
 StreamEndCallback = Callable[[int], Awaitable[None]]
@@ -156,8 +157,8 @@ class VoiceChatManager:
             resolve_peer() → tgcalls.play()
 
         Case 3 — Not a member, private group (no username):
-            Logged as ERROR. Returns False.
-            Bot replies: ask an admin to add the assistant.
+            Raises PrivateGroupError.
+            Handler shows: ask admin to add @Shade_music_assistant.
 
         Case 4 — join_chat() fails:
             Logged as ERROR. Returns False. No broken VC state.
@@ -359,7 +360,7 @@ class VoiceChatManager:
           1. Use bot_client.get_chat() to learn the group's username.
              (The bot always knows the group — it received the /play command.)
           2. If the group has a username → assistant.join_chat(username).
-          3. If no username (private group) → log + return False.
+          3. If no username (private group) → raise PrivateGroupError.
           4. join_chat raises → log + return False.
 
         Returns True when the assistant successfully joined.
@@ -383,12 +384,18 @@ class VoiceChatManager:
 
         if not username:
             # Private group — cannot auto-join without an invite link.
-            logger.error(
-                "[VOICE] Cannot auto-join — group is PRIVATE (no username).  "
-                "An admin must add the assistant account to chat_id={} manually.",
+            # Raise PrivateGroupError (subclass of VoiceChatError) so the
+            # handler can show the specific manual-add message instead of
+            # the generic "Could not join voice chat" message.
+            logger.warning(
+                "[VOICE] Group is PRIVATE — assistant must be added manually  "
+                "chat_id={}",
                 chat_id,
             )
-            return False
+            raise PrivateGroupError(
+                f"Group {chat_id} is private. "
+                "An admin must add the assistant account manually."
+            )
 
         # ── Attempt join via public username ───────────────────────────────
         logger.info(

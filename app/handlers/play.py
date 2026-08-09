@@ -39,6 +39,7 @@ from app.shared.errors import (
     PLAY_NO_QUERY,
     PLAY_NO_RESULTS,
     PLAY_NO_VOICE_CHAT,
+    PLAY_PRIVATE_GROUP,
     PLAY_QUEUE_FULL,
     PLAY_RATE_LIMITED,
     PLAY_UNEXPECTED_ERROR,
@@ -46,6 +47,7 @@ from app.shared.errors import (
 )
 from app.shared.exceptions import (
     NoResultsError,
+    PrivateGroupError,
     QueueFullError,
     VoiceChatError,
 )
@@ -128,6 +130,9 @@ def register(client: Client, controller: PlaybackController) -> None:
             return
         except QueueFullError as exc:
             await interim.edit_text(str(exc))
+            return
+        except PrivateGroupError:
+            await interim.edit_text(PLAY_PRIVATE_GROUP)
             return
         except VoiceChatError:
             await interim.edit_text(PLAY_NO_VOICE_CHAT)
