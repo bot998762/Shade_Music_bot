@@ -61,13 +61,3 @@ class QueueFullError(ShadeBotError):
 
 class ValidationError(ShadeBotError):
     """Raised when user input fails validation checks."""
-
-
-class PrivateGroupError(VoiceChatError):
-    """
-    Raised when the assistant cannot join because the group is private.
-
-    The user must manually add the assistant account to the group.
-    Subclasses VoiceChatError so existing catch-all VoiceChatError handlers
-    still work; handlers that need the specific message catch this first.
-    """

@@ -55,7 +55,3 @@ ADDED_TO_QUEUE = (
 
 # ── General ───────────────────────────────────────────────────────────────────
 SEARCHING = "🔍 Searching for **{query}**…"
-
-PLAY_PRIVATE_GROUP = (
-    "❌ Please add @Shade_music_assistant to this group first, then try /play."
-)
