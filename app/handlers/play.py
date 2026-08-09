@@ -46,6 +46,7 @@ from app.shared.errors import (
 )
 from app.shared.exceptions import (
     NoResultsError,
+    PrivateGroupError,
     QueueFullError,
     VoiceChatError,
 )
@@ -128,6 +129,11 @@ def register(client: Client, controller: PlaybackController) -> None:
             return
         except QueueFullError as exc:
             await interim.edit_text(str(exc))
+            return
+        except PrivateGroupError:
+            await interim.edit_text(
+                "❌ Please add @Shade_music_assistant to this group first, then try /play."
+            )
             return
         except VoiceChatError:
             await interim.edit_text(PLAY_NO_VOICE_CHAT)

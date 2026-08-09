@@ -51,6 +51,10 @@ class NoActiveVoiceChatError(VoiceChatError):
     """Raised when the target group has no active voice chat."""
 
 
+class PrivateGroupError(VoiceChatError):
+    """Raised when the assistant is not a member of a private group."""
+
+
 # ── Playback ──────────────────────────────────────────────────────────────────
 
 class QueueFullError(ShadeBotError):

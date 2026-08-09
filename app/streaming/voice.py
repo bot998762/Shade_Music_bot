@@ -62,6 +62,7 @@ from pytgcalls.types import ChatUpdate, MediaStream, Update
 from pytgcalls.types.stream import StreamEnded as StreamAudioEnded
 
 from app.infrastructure.logger import logger
+from app.shared.exceptions import PrivateGroupError
 from app.streaming.media import AUDIO_QUALITY, IGNORE_VIDEO
 
 StreamEndCallback = Callable[[int], Awaitable[None]]
@@ -388,7 +389,7 @@ class VoiceChatManager:
                 "An admin must add the assistant account to chat_id={} manually.",
                 chat_id,
             )
-            return False
+            raise PrivateGroupError()
 
         # ── Attempt join via public username ───────────────────────────────
         logger.info(
