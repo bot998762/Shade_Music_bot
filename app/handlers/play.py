@@ -44,6 +44,7 @@ from app.shared.errors import (
     PLAY_PRIVATE_GROUP,
     PLAY_QUEUE_FULL,
     PLAY_RATE_LIMITED,
+    PLAY_STREAM_TIMEOUT,
     PLAY_UNEXPECTED_ERROR,
     SEARCHING,
 )
@@ -51,6 +52,7 @@ from app.shared.exceptions import (
     NoResultsError,
     PrivateGroupError,
     QueueFullError,
+    StreamResolveTimeoutError,
     VoiceChatError,
 )
 from app.shared.validators import (
@@ -147,6 +149,17 @@ def register(client: Client, controller: PlaybackController) -> None:
             return
         except QueueFullError as exc:
             await interim.edit_text(str(exc))
+            return
+        except StreamResolveTimeoutError:
+            # Resolver timed out — fallback was suppressed (OOM prevention).
+            # The ghost executor thread may still be running; no new yt-dlp
+            # process was spawned.  Ask the user to retry; by the time they do,
+            # the ghost thread has likely finished and the executor is free.
+            logger.warning(
+                "[PLAY] Stream resolution timed out  chat_id={}  query='{}'",
+                msg.chat.id, query,
+            )
+            await interim.edit_text(PLAY_STREAM_TIMEOUT)
             return
         except PrivateGroupError:
             # Must be caught before VoiceChatError (it is a subclass).

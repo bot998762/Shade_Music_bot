@@ -53,6 +53,20 @@ dict option (cookiefile="...") in this module DO work correctly.
 Resolving the CDN URL here hands ntgcalls a direct https://... URL that
 requires zero authentication — yt-dlp runs zero times inside ntgcalls.
 
+Failure modes (Phase-1 OOM fix)
+--------------------------------
+resolve() previously returned None for BOTH timeout and extraction failure.
+This was ambiguous and caused the OOM: the controller could not distinguish
+a timeout (ghost thread still running) from a genuine DownloadError (thread
+already exited cleanly).  With None, it always fell back to
+FFmpegStreamBuilder.build_from_youtube() — launching a second yt-dlp + Deno
+while the ghost thread's copies were still alive.
+
+New contract:
+  SUCCESS         → returns the direct CDN URL string (str)
+  DOWNLOAD ERROR  → returns None  (caller may fall back — thread already done)
+  TIMEOUT         → raises StreamResolveTimeoutError  (caller MUST NOT fall back)
+
 Stage log: [RESOLVE]
 """
 
@@ -74,6 +88,7 @@ from app.shared.constants import (
     YT_EXECUTOR_NAME,
     YT_EXECUTOR_WORKERS,
 )
+from app.shared.exceptions import StreamResolveTimeoutError
 
 # ── Thread executor ────────────────────────────────────────────────────────────
 # Separate executor from search so a slow resolution doesn't block searches.
@@ -142,8 +157,22 @@ class StreamResolver:
         """
         Resolve a direct CDN audio URL from a YouTube watch URL.
 
-        Returns the direct https://... CDN URL on success.
-        Returns None on failure — caller falls back to FFmpeg direct extraction.
+        Returns
+        -------
+        str
+            The direct https://... CDN URL on success.
+        None
+            On genuine extraction failure (DownloadError, format not found,
+            etc.).  The caller MAY fall back to FFmpegStreamBuilder in this
+            case because the executor thread has already exited cleanly.
+
+        Raises
+        ------
+        StreamResolveTimeoutError
+            When asyncio.wait_for() times out.  The caller MUST NOT fall
+            back — the underlying executor thread is still running yt-dlp
+            + Deno and falling back would create a second yt-dlp + Deno +
+            FFmpeg stack, causing the confirmed OOM on Render 512 MB.
 
         Stage log: [RESOLVE]
         """
@@ -169,8 +198,28 @@ class StreamResolver:
                 )
             return url
         except asyncio.TimeoutError:
-            logger.error("[RESOLVE] Timed out for '{}'", webpage_url)
-            return None
+            # CRITICAL: Do NOT return None here.
+            # Returning None would cause _build_stream() to fall back to
+            # FFmpegStreamBuilder.build_from_youtube(), which launches a second
+            # yt-dlp + Deno + FFmpeg while the ghost executor thread's yt-dlp
+            # + Deno are still running — confirmed OOM trigger on Render 512 MB.
+            #
+            # Raising StreamResolveTimeoutError instead signals the controller
+            # that fallback is forbidden for this failure mode.
+            #
+            # Phase-1 accepted limitation: the ghost thread continues until
+            # _sync_resolve() completes naturally (up to ~60–120 s in worst
+            # case).  It cannot be killed without subprocess-based resolution
+            # (Phase 2).  Preventing the fallback is sufficient to avoid OOM.
+            logger.error(
+                "[RESOLVE] Timed out for '{}' — "
+                "ghost executor thread may still be running; "
+                "fallback suppressed to prevent OOM",
+                webpage_url,
+            )
+            raise StreamResolveTimeoutError(
+                f"Stream resolution timed out for: {webpage_url}"
+            )
 
     @staticmethod
     def shutdown() -> None:

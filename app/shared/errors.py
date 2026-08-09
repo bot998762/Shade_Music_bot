@@ -67,3 +67,7 @@ ADDED_TO_QUEUE = (
 # ── General ───────────────────────────────────────────────────────────────────
 SEARCHING    = "🔍 Searching for **{query}**…"
 LOADING_URL  = "⏳ Loading URL…"
+
+PLAY_STREAM_TIMEOUT = (
+    "❌ Stream resolution timed out. Please try again."
+)

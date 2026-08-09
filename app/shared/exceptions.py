@@ -12,6 +12,7 @@ ShadeBotError
 ├── SearchError
 │   └── NoResultsError
 ├── StreamResolveError
+│   └── StreamResolveTimeoutError   ← Phase-1 OOM fix: timeout ≠ failure
 ├── VoiceChatError
 │   ├── NoActiveVoiceChatError
 │   └── PrivateGroupError
@@ -40,6 +41,29 @@ class NoResultsError(SearchError):
 
 class StreamResolveError(ShadeBotError):
     """Raised when a direct audio CDN URL cannot be resolved."""
+
+
+class StreamResolveTimeoutError(StreamResolveError):
+    """
+    Raised when resolver.resolve() times out via asyncio.TimeoutError.
+
+    CRITICAL DISTINCTION (Phase-1 OOM fix):
+    This is NOT the same as a DownloadError / extraction failure.
+
+    - DownloadError  → fallback to FFmpegStreamBuilder.build_from_youtube() is ALLOWED.
+    - TimeoutError   → fallback is FORBIDDEN.
+
+    Why: When asyncio.wait_for() cancels the Future, the underlying
+    ThreadPoolExecutor thread continues running yt-dlp + Deno.  If the
+    controller immediately falls back to build_from_youtube(), ntgcalls
+    spawns a second yt-dlp + second Deno + FFmpeg while the ghost thread's
+    yt-dlp + Deno are still alive.  On Render's 512 MB limit this causes
+    OOM (SIGKILL / exit 137).
+
+    Catching this exception and NOT falling back eliminates the duplicate
+    process overlap.  The ghost thread's memory (~90–180 MB) is no longer
+    compounded by a second extraction peak (~120–240 MB).
+    """
 
 
 # ── Voice chat ────────────────────────────────────────────────────────────────

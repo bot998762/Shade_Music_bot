@@ -55,6 +55,19 @@ advance() workflow  (called by StreamMonitor on stream-end)
 7. [ADVANCE]   Retry up to MAX_SKIP_RETRIES on change_stream failure
 8. [ADVANCE]   Retries exhausted? → cleanup → IDLE
 
+_build_stream() failure modes (Phase-1 OOM fix)
+------------------------------------------------
+resolver.resolve() now raises StreamResolveTimeoutError on asyncio timeout
+instead of returning None.  This lets _build_stream() distinguish:
+
+  SUCCESS (str returned)              → primary CDN path
+  DOWNLOAD_ERROR (None returned)      → fallback allowed (thread exited)
+  TIMEOUT (StreamResolveTimeoutError) → fallback FORBIDDEN (ghost thread)
+
+On timeout, _build_stream() re-raises StreamResolveTimeoutError.
+_start_now() and advance() propagate it to the handler / cleanup path.
+No yt-dlp subprocess is spawned via ntgcalls on the timeout path.
+
 Stage log: [CONTROLLER]
 """
 
@@ -72,7 +85,13 @@ from app.search.resolver import StreamResolver
 from app.search.youtube import YouTubeSearch
 from app.shared.constants import MAX_SKIP_RETRIES
 from app.shared.errors import NOW_PLAYING
-from app.shared.exceptions import NoResultsError, PrivateGroupError, QueueFullError, VoiceChatError
+from app.shared.exceptions import (
+    NoResultsError,
+    PrivateGroupError,
+    QueueFullError,
+    StreamResolveTimeoutError,
+    VoiceChatError,
+)
 from app.shared.validators import is_direct_url
 from app.streaming.ffmpeg import FFmpegStreamBuilder
 from app.streaming.voice import VoiceChatManager
@@ -155,10 +174,13 @@ class PlaybackController:
             When the search returns no results.
         QueueFullError
             When the chat's queue is at its limit.
+        StreamResolveTimeoutError
+            When the resolver times out.  Fallback was suppressed.
+            The caller should show a "try again" message.
         VoiceChatError
             When the VC join fails.
         """
-        # ── Stage: SEARCH or DIRECT-URL FETCH ────────────────────────────
+        # ── Stage: SEARCH or DIRECT-URL FETCH ────────────────────────
         # For a direct URL: skip the ytsearch1: round-trip and fetch metadata
         # directly.  The CDN stream URL is still resolved by _build_stream()
         # at play time — same path as for search results.
@@ -269,7 +291,23 @@ class PlaybackController:
                     "[CONTROLLER] [ADVANCE] Next track: '{}'  chat_id={}",
                     next_track.title, chat_id,
                 )
-                stream = await self._build_stream(next_track)
+                try:
+                    stream = await self._build_stream(next_track)
+                except StreamResolveTimeoutError:
+                    # Timeout during advance: do NOT fall back (OOM risk).
+                    # Log clearly and treat this advance attempt as a failure,
+                    # but do NOT trigger cleanup — the VC may still be active
+                    # from the previous track.  Count as a retry so we can
+                    # skip forward or give up gracefully.
+                    logger.error(
+                        "[CONTROLLER] [ADVANCE] Resolver timeout for '{}' — "
+                        "fallback suppressed; counting as skip attempt {}/{}  "
+                        "chat_id={}",
+                        next_track.title, retries + 1, MAX_SKIP_RETRIES, chat_id,
+                    )
+                    retries += 1
+                    continue
+
                 changed = await self._voice.change_stream(chat_id, stream)
 
                 if changed:
@@ -312,8 +350,9 @@ class PlaybackController:
 
         Called by play() when the chat was idle — first track in a new session.
 
-        On VC join failure: runs cleanup() to clear the queue and then raises
-        VoiceChatError. State remains IDLE. The next /play starts clean.
+        On resolver timeout: runs cleanup() and re-raises StreamResolveTimeoutError.
+        On VC join failure: runs cleanup() and raises VoiceChatError.
+        State remains IDLE in both cases. The next /play starts clean.
 
         Stage log: [RESOLVE] [FFMPEG] [JOIN VC] [PLAY]
         """
@@ -326,7 +365,18 @@ class PlaybackController:
             "[CONTROLLER] [RESOLVE] Resolving stream  title='{}'",
             track.title,
         )
-        stream = await self._build_stream(track)
+        try:
+            stream = await self._build_stream(track)
+        except StreamResolveTimeoutError:
+            # Timeout: fallback suppressed.  Clean up the dequeued track
+            # so state is IDLE and the next /play starts fresh.
+            logger.error(
+                "[CONTROLLER] Resolver timeout — fallback disabled  "
+                "title='{}'  chat_id={}",
+                track.title, chat_id,
+            )
+            await self._cleanup.cleanup(chat_id, reason="resolver_timeout")
+            raise  # propagates to play() → handler shows user-facing message
 
         # ── Stage: JOIN VC ────────────────────────────────────────────────
         logger.info(
@@ -369,10 +419,17 @@ class PlaybackController:
         This is the only place stream resolution and MediaStream creation occur.
 
         Primary:  StreamResolver → direct CDN URL → FFmpegStreamBuilder.build_from_url()
-        Fallback: FFmpegStreamBuilder.build_from_youtube() when resolver fails.
+        Fallback: FFmpegStreamBuilder.build_from_youtube() — ONLY on genuine
+                  extraction failure (resolver returns None).  NEVER on timeout.
+
+        Raises
+        ------
+        StreamResolveTimeoutError
+            Propagated from resolver.resolve().  Caller MUST NOT fall back.
 
         Stage log: [RESOLVE] [FFMPEG]
         """
+        # StreamResolveTimeoutError propagates unmodified — do NOT catch it here.
         direct_url = await self._resolver.resolve(track.webpage_url)
 
         if direct_url:
@@ -384,9 +441,12 @@ class PlaybackController:
             logger.info("[CONTROLLER] [FFMPEG] Building MediaStream from direct URL")
             return FFmpegStreamBuilder.build_from_url(direct_url)
 
+        # direct_url is None → genuine extraction failure (DownloadError etc.)
+        # The executor thread has already exited; no ghost process is running.
+        # Fallback is safe here.
         logger.warning(
             "[CONTROLLER] [RESOLVE] Resolver returned None for '{}' — "
-            "using fallback",
+            "using fallback (genuine extraction failure, not timeout)",
             track.title,
         )
         logger.warning("[CONTROLLER] [FFMPEG] Building fallback MediaStream")
