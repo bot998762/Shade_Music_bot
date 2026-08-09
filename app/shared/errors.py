@@ -34,23 +34,6 @@ PLAY_NO_VOICE_CHAT = (
     "Make sure a voice chat is active and the assistant has permission to join."
 )
 
-# Shown when the assistant is not in the group and it is private (no username).
-# The user must ask an admin to add the assistant manually.
-PLAY_ASSISTANT_NOT_MEMBER = (
-    "❌ The assistant account is not in this group.\n\n"
-    "This is a **private group** — it cannot be joined automatically.\n\n"
-    "Ask a group admin to add the assistant account as a member, "
-    "then try `/play` again."
-)
-
-# Shown when auto-join of a public group was attempted but rejected
-# (e.g. approval-required, channel-type group, or other restriction).
-PLAY_ASSISTANT_JOIN_FAILED = (
-    "❌ Could not add the assistant account to this group automatically.\n\n"
-    "Ask a group admin to add the assistant account as a member, "
-    "then try `/play` again."
-)
-
 PLAY_UNEXPECTED_ERROR = (
     "❌ An unexpected error occurred. Please try again."
 )

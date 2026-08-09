@@ -26,30 +26,6 @@ with the same mweb,web,tv_embedded client priority as the primary path.
 For age-gated or geo-blocked videos, valid cookies from a logged-in Google
 account are also required.
 
-FFmpeg input flags (ffmpeg_parameters)
----------------------------------------
-Both paths pass FFMPEG_INPUT_FLAGS as ffmpeg_parameters.  ntgcalls 2.2.5
-prepends these before the "-i <url>" argument in its internal ffmpeg call:
-
-    ffmpeg {ffmpeg_parameters} -i <url> -f s16le -ac 2 -ar 48000 pipe:1
-
-The flags add HTTP reconnect handling and a larger network read buffer:
-
-reconnect / reconnect_streamed / reconnect_delay_max
-    googlevideo.com CDN connections can drop at DASH segment boundaries.
-    Without reconnect flags, FFmpeg exits on the first drop; ntgcalls
-    fires StreamAudioEnded; the queue advances unexpectedly — the user
-    hears a sudden cut or track skip.  These flags tell FFmpeg to retry
-    the HTTP connection in-place with a ≤5 s back-off.
-
-buffer_size 8192k
-    Raises the avformat network read buffer from the default 32 KB to
-    8 MB, giving ~40 s of headroom at 160 kbps (the typical opus/webm
-    audio-only bitrate from mweb).  On Render's shared network a momentary
-    CDN slowdown can drain the 32 KB default in under 2 s, causing the
-    brief stutter-without-disconnect symptom.  The larger buffer fills
-    opportunistically and does not increase start latency.
-
 Stage log: [FFMPEG]
 """
 
@@ -60,11 +36,7 @@ import shutil
 from typing import Optional
 
 from app.infrastructure.logger import logger
-from app.shared.constants import (
-    COOKIES_SECRETS_DIR,
-    COOKIES_TMP_DIR,
-    FFMPEG_INPUT_FLAGS,
-)
+from app.shared.constants import COOKIES_SECRETS_DIR, COOKIES_TMP_DIR
 from app.streaming.media import AUDIO_QUALITY, IGNORE_VIDEO, MediaStream
 
 
@@ -85,9 +57,6 @@ class FFmpegStreamBuilder:
         No cookies or extractor-args needed here — auth already happened in
         StreamResolver which produced the direct URL.
 
-        FFMPEG_INPUT_FLAGS are added as ffmpeg_parameters to handle CDN
-        reconnects and buffer the network read to absorb transient slowdowns.
-
         Stage log: [FFMPEG] primary
         """
         logger.info("[FFMPEG] primary — direct CDN URL  url={}...", direct_url[:70])
@@ -95,7 +64,6 @@ class FFmpegStreamBuilder:
             direct_url,
             AUDIO_QUALITY,
             video_flags=IGNORE_VIDEO,
-            ffmpeg_parameters=FFMPEG_INPUT_FLAGS,
         )
 
     @staticmethod
@@ -111,9 +79,6 @@ class FFmpegStreamBuilder:
         so ntgcalls' internal yt-dlp also benefits from Deno PO-token
         generation.  For age-gated or geo-blocked videos, valid cookies
         are still required; without them those videos will also fail.
-
-        FFMPEG_INPUT_FLAGS are added as ffmpeg_parameters alongside
-        ytdlp_parameters.  ntgcalls 2.2.5 accepts both independently.
 
         Stage log: [FFMPEG] fallback
         """
@@ -145,7 +110,6 @@ class FFmpegStreamBuilder:
             AUDIO_QUALITY,
             video_flags=IGNORE_VIDEO,
             ytdlp_parameters=ytdlp_params,
-            ffmpeg_parameters=FFMPEG_INPUT_FLAGS,
         )
 
 

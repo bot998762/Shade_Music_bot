@@ -72,7 +72,7 @@ from app.search.resolver import StreamResolver
 from app.search.youtube import YouTubeSearch
 from app.shared.constants import MAX_SKIP_RETRIES
 from app.shared.errors import NOW_PLAYING
-from app.shared.exceptions import AssistantNotMemberError, NoResultsError, QueueFullError, VoiceChatError
+from app.shared.exceptions import NoResultsError, QueueFullError, VoiceChatError
 from app.streaming.ffmpeg import FFmpegStreamBuilder
 from app.streaming.voice import VoiceChatManager
 
@@ -304,15 +304,7 @@ class PlaybackController:
             "[CONTROLLER] [JOIN VC] Joining voice chat  chat_id={}",
             chat_id,
         )
-        # AssistantNotMemberError is a VoiceChatError subclass raised by
-        # VoiceChatManager.play() when the assistant is not in the group.
-        # Catch it here so we can run cleanup before re-raising — the handler
-        # catches it first to show the right user-facing message.
-        try:
-            joined = await self._voice.play(chat_id, stream)
-        except AssistantNotMemberError:
-            await self._cleanup.cleanup(chat_id, reason="assistant_not_member")
-            raise  # handler catches AssistantNotMemberError before VoiceChatError
+        joined = await self._voice.play(chat_id, stream)
 
         if not joined:
             # Wipe the session clean before raising.

@@ -36,8 +36,6 @@ from app.shared.constants import PLAY_COOLDOWN_SECONDS
 from app.shared.errors import (
     ADDED_TO_QUEUE,
     NOW_PLAYING,
-    PLAY_ASSISTANT_JOIN_FAILED,
-    PLAY_ASSISTANT_NOT_MEMBER,
     PLAY_NO_QUERY,
     PLAY_NO_RESULTS,
     PLAY_NO_VOICE_CHAT,
@@ -47,7 +45,6 @@ from app.shared.errors import (
     SEARCHING,
 )
 from app.shared.exceptions import (
-    AssistantNotMemberError,
     NoResultsError,
     QueueFullError,
     VoiceChatError,
@@ -131,16 +128,6 @@ def register(client: Client, controller: PlaybackController) -> None:
             return
         except QueueFullError as exc:
             await interim.edit_text(str(exc))
-            return
-        except AssistantNotMemberError as exc:
-            # Distinguish private-group (admin must add manually) from
-            # join-rejected (public group but approval-required or restricted).
-            msg = (
-                PLAY_ASSISTANT_NOT_MEMBER
-                if str(exc) == "private"
-                else PLAY_ASSISTANT_JOIN_FAILED
-            )
-            await interim.edit_text(msg)
             return
         except VoiceChatError:
             await interim.edit_text(PLAY_NO_VOICE_CHAT)

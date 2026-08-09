@@ -13,8 +13,7 @@ ShadeBotError
 │   └── NoResultsError
 ├── StreamResolveError
 ├── VoiceChatError
-│   ├── NoActiveVoiceChatError
-│   └── AssistantNotMemberError
+│   └── NoActiveVoiceChatError
 ├── QueueFullError
 └── ValidationError
 """
@@ -50,18 +49,6 @@ class VoiceChatError(ShadeBotError):
 
 class NoActiveVoiceChatError(VoiceChatError):
     """Raised when the target group has no active voice chat."""
-
-
-class AssistantNotMemberError(VoiceChatError):
-    """
-    Raised when the assistant account is not in the group and either:
-      - the group is private (no username → cannot auto-join), or
-      - a join attempt was made but rejected.
-
-    The message field distinguishes the two sub-cases:
-      "private"     → private group, admin must add manually
-      "join_failed" → join attempt rejected (approval-required, channel, etc.)
-    """
 
 
 # ── Playback ──────────────────────────────────────────────────────────────────
