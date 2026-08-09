@@ -35,10 +35,13 @@ from app.playback.controller import PlaybackController
 from app.shared.constants import PLAY_COOLDOWN_SECONDS
 from app.shared.errors import (
     ADDED_TO_QUEUE,
+    LOADING_URL,
     NOW_PLAYING,
     PLAY_NO_QUERY,
     PLAY_NO_RESULTS,
     PLAY_NO_VOICE_CHAT,
+    PLAY_PLAYLIST_NOT_SUPPORTED,
+    PLAY_PRIVATE_GROUP,
     PLAY_QUEUE_FULL,
     PLAY_RATE_LIMITED,
     PLAY_UNEXPECTED_ERROR,
@@ -50,7 +53,12 @@ from app.shared.exceptions import (
     QueueFullError,
     VoiceChatError,
 )
-from app.shared.validators import normalise_query, validate_play_query
+from app.shared.validators import (
+    is_direct_url,
+    is_playlist_url,
+    normalise_query,
+    validate_play_query,
+)
 
 # ── Per-user rate limiting ────────────────────────────────────────────────────
 # Maps user_id → monotonic timestamp of last /play call.
@@ -110,11 +118,21 @@ def register(client: Client, controller: PlaybackController) -> None:
             )
             return
 
+        # ── Playlist guard (Phase 1 — playlist support deferred to Phase 3) ─
+        if is_direct_url(query) and is_playlist_url(query):
+            await msg.reply_text(PLAY_PLAYLIST_NOT_SUPPORTED, quote=True)
+            return
+
         # ── Interim message ────────────────────────────────────────────────
-        interim = await msg.reply_text(
-            SEARCHING.format(query=query),
-            quote=True,
-        )
+        # Show a URL-specific message when loading a direct link so the
+        # interim doesn't read "Searching for https://..."
+        if is_direct_url(query):
+            interim = await msg.reply_text(LOADING_URL, quote=True)
+        else:
+            interim = await msg.reply_text(
+                SEARCHING.format(query=query),
+                quote=True,
+            )
 
         # ── Delegate to PlaybackController ─────────────────────────────────
         try:
@@ -131,9 +149,8 @@ def register(client: Client, controller: PlaybackController) -> None:
             await interim.edit_text(str(exc))
             return
         except PrivateGroupError:
-            await interim.edit_text(
-                "❌ Please add @Shade_music_assistant to this group first, then try /play."
-            )
+            # Must be caught before VoiceChatError (it is a subclass).
+            await interim.edit_text(PLAY_PRIVATE_GROUP)
             return
         except VoiceChatError:
             await interim.edit_text(PLAY_NO_VOICE_CHAT)

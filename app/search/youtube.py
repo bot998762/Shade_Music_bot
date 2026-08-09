@@ -115,6 +115,37 @@ class YouTubeSearch:
             logger.error("[SEARCH] Timed out for '{}'", query)
             return None
 
+    async def fetch_url_metadata(self, url: str) -> Optional[SearchResult]:
+        """
+        Fetch metadata for a direct URL without the ``ytsearch1:`` prefix.
+
+        Used by PlaybackController when the /play argument is a URL.
+        Skips the search round-trip entirely — yt-dlp extracts title,
+        duration, and uploader from the page URL directly.
+
+        Returns None on failure — caller raises NoResultsError on None.
+
+        Stage log: [FETCH_URL]
+        """
+        logger.info("[SEARCH] [FETCH_URL] url='{}'", url)
+        loop = asyncio.get_running_loop()
+        try:
+            result = await asyncio.wait_for(
+                loop.run_in_executor(_EXECUTOR, self._sync_fetch_url, url),
+                timeout=SEARCH_TIMEOUT_SEC,
+            )
+            if result:
+                logger.info(
+                    "[SEARCH] [FETCH_URL] OK  title='{}'  url='{}'",
+                    result.title, result.webpage_url,
+                )
+            else:
+                logger.warning("[SEARCH] [FETCH_URL] No metadata for '{}'", url)
+            return result
+        except asyncio.TimeoutError:
+            logger.error("[SEARCH] [FETCH_URL] Timed out for '{}'", url)
+            return None
+
     @staticmethod
     def shutdown() -> None:
         """Drain the thread executor on application shutdown."""
@@ -177,6 +208,63 @@ class YouTubeSearch:
             return None
         except Exception as exc:
             logger.error("[SEARCH] Unexpected error for '{}': {}", query, exc)
+            return None
+
+
+    def _sync_fetch_url(self, url: str) -> Optional[SearchResult]:
+        """
+        Direct yt-dlp metadata extraction for a known URL.
+
+        Uses the same options as _sync_search (metadata-only, no CDN resolve)
+        but passes the URL directly instead of prefixing with ``ytsearch1:``.
+
+        For a single video URL, yt-dlp returns the info dict at the top level
+        (not nested inside an ``entries`` list as with search results).
+        """
+        opts = dict(_SEARCH_OPTS)
+        # default_search is irrelevant when passing a URL directly.
+        opts.pop("default_search", None)
+        if self._cookies_path:
+            opts["cookiefile"] = self._cookies_path
+
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+
+            if not info:
+                return None
+
+            # Direct URL: metadata is at the top level, not in entries[].
+            title:       str = info.get("title") or "Unknown Title"
+            raw_duration     = info.get("duration")
+            duration:    int = int(raw_duration) if raw_duration else 0
+            webpage_url: str = info.get("webpage_url") or url
+            uploader:    str = (
+                info.get("uploader")
+                or info.get("channel")
+                or info.get("uploader_id")
+                or "Unknown"
+            )
+
+            thumbnail: Optional[str] = info.get("thumbnail")
+            if thumbnail is None:
+                thumbs: List = info.get("thumbnails") or []
+                if thumbs:
+                    thumbnail = thumbs[-1].get("url")
+
+            return SearchResult(
+                title=title,
+                duration=duration,
+                webpage_url=webpage_url,
+                uploader=uploader,
+                thumbnail=thumbnail,
+            )
+
+        except yt_dlp.utils.DownloadError as exc:
+            logger.error("[SEARCH] [FETCH_URL] DownloadError for '{}': {}", url, exc)
+            return None
+        except Exception as exc:
+            logger.error("[SEARCH] [FETCH_URL] Unexpected error for '{}': {}", url, exc)
             return None
 
 

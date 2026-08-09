@@ -384,12 +384,19 @@ class VoiceChatManager:
 
         if not username:
             # Private group — cannot auto-join without an invite link.
+            # Raise PrivateGroupError so the handler can show a specific
+            # "add @Shade_music_assistant" message instead of the generic
+            # voice-chat error.  Cleanup is handled by the controller's
+            # _start_now() which catches this exception before re-raising.
             logger.error(
                 "[VOICE] Cannot auto-join — group is PRIVATE (no username).  "
                 "An admin must add the assistant account to chat_id={} manually.",
                 chat_id,
             )
-            raise PrivateGroupError()
+            raise PrivateGroupError(
+                f"The assistant is not a member of private chat_id={chat_id}. "
+                "An admin must add @Shade_music_assistant to the group."
+            )
 
         # ── Attempt join via public username ───────────────────────────────
         logger.info(

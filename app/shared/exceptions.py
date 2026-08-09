@@ -13,7 +13,8 @@ ShadeBotError
 │   └── NoResultsError
 ├── StreamResolveError
 ├── VoiceChatError
-│   └── NoActiveVoiceChatError
+│   ├── NoActiveVoiceChatError
+│   └── PrivateGroupError
 ├── QueueFullError
 └── ValidationError
 """
@@ -52,7 +53,13 @@ class NoActiveVoiceChatError(VoiceChatError):
 
 
 class PrivateGroupError(VoiceChatError):
-    """Raised when the assistant is not a member of a private group."""
+    """
+    Raised when the assistant cannot auto-join a private group.
+
+    Private groups have no public username, so the assistant cannot be
+    invited automatically.  An admin must add @Shade_music_assistant
+    to the group manually before /play can be used.
+    """
 
 
 # ── Playback ──────────────────────────────────────────────────────────────────

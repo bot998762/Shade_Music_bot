@@ -42,6 +42,35 @@ def validate_user_id(user_id: int) -> Tuple[bool, str]:
     return True, ""
 
 
+def is_direct_url(query: str) -> bool:
+    """
+    Return True when the query is a direct URL rather than a search term.
+
+    Detects http:// and https:// URLs.  Does not validate URL correctness —
+    the yt-dlp resolver will report extraction errors on invalid URLs.
+    """
+    return query.startswith(("http://", "https://"))
+
+
+def is_playlist_url(url: str) -> bool:
+    """
+    Return True when the URL is a pure playlist rather than a single video.
+
+    Rejects YouTube /playlist? URLs and any URL that has a list= parameter
+    without a v= parameter (or youtu.be/ single-video shortlink).
+
+    Phase-1 guard only — playlist support is intentionally deferred to Phase 3.
+    """
+    lower = url.lower()
+    # Explicit playlist endpoint
+    if "youtube.com/playlist" in lower:
+        return True
+    # Playlist parameter without a specific video
+    if "list=" in lower and "v=" not in lower and "youtu.be/" not in lower:
+        return True
+    return False
+
+
 def normalise_query(query: str) -> str:
     """
     Normalise a search query for consistent processing.

@@ -112,5 +112,6 @@ def _check_bot() -> bool:
     bot_client = getattr(_lifecycle, "bot_client", None)
     if bot_client is None:
         return False
-    client = getattr(bot_client, "_client", None)
-    return client is not None and getattr(client, "is_connected", False)
+    # bot_client is a Pyrogram Client directly (not a wrapper).
+    # Client.is_connected is a bool property indicating the MTProto connection.
+    return getattr(bot_client, "is_connected", False)

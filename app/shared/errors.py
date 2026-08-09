@@ -34,6 +34,17 @@ PLAY_NO_VOICE_CHAT = (
     "Make sure a voice chat is active and the assistant has permission to join."
 )
 
+PLAY_PRIVATE_GROUP = (
+    "❌ The assistant is not in this group.\n\n"
+    "Please ask an admin to add **@Shade_music_assistant** to the group, "
+    "then try again."
+)
+
+PLAY_PLAYLIST_NOT_SUPPORTED = (
+    "❌ Playlist URLs are not supported yet.\n\n"
+    "Please send a single song URL or search by name instead."
+)
+
 PLAY_UNEXPECTED_ERROR = (
     "❌ An unexpected error occurred. Please try again."
 )
@@ -54,4 +65,5 @@ ADDED_TO_QUEUE = (
 )
 
 # ── General ───────────────────────────────────────────────────────────────────
-SEARCHING = "🔍 Searching for **{query}**…"
+SEARCHING    = "🔍 Searching for **{query}**…"
+LOADING_URL  = "⏳ Loading URL…"

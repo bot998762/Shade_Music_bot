@@ -72,7 +72,8 @@ from app.search.resolver import StreamResolver
 from app.search.youtube import YouTubeSearch
 from app.shared.constants import MAX_SKIP_RETRIES
 from app.shared.errors import NOW_PLAYING
-from app.shared.exceptions import NoResultsError, QueueFullError, VoiceChatError
+from app.shared.exceptions import NoResultsError, PrivateGroupError, QueueFullError, VoiceChatError
+from app.shared.validators import is_direct_url
 from app.streaming.ffmpeg import FFmpegStreamBuilder
 from app.streaming.voice import VoiceChatManager
 
@@ -120,9 +121,15 @@ class PlaybackController:
         self._notify   = notify
         self._max_q    = max_queue
         self._cookies  = cookies_path
-        # One lock per chat — prevents concurrent StreamAudioEnded events
+        # One advance lock per chat — prevents concurrent StreamAudioEnded events
         # from double-advancing the queue.
         self._advance_locks: Dict[int, asyncio.Lock] = {}
+        # One play lock per chat — prevents concurrent /play commands in the
+        # same idle chat from each calling _start_now() simultaneously.
+        # The search stage (slow I/O) runs BEFORE acquiring this lock so
+        # unrelated chats and even concurrent searches in the same chat are
+        # never serialised.  Different chats use different locks.
+        self._play_locks: Dict[int, asyncio.Lock] = {}
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -151,14 +158,25 @@ class PlaybackController:
         VoiceChatError
             When the VC join fails.
         """
-        # ── Stage: SEARCH ─────────────────────────────────────────────────
-        logger.info("[CONTROLLER] [SEARCH] query='{}'  chat_id={}", query, chat_id)
-        result = await self._search.search(query)
+        # ── Stage: SEARCH or DIRECT-URL FETCH ────────────────────────────
+        # For a direct URL: skip the ytsearch1: round-trip and fetch metadata
+        # directly.  The CDN stream URL is still resolved by _build_stream()
+        # at play time — same path as for search results.
+        if is_direct_url(query):
+            logger.info(
+                "[CONTROLLER] [FETCH_URL] Direct URL  url='{}'  chat_id={}",
+                query, chat_id,
+            )
+            result = await self._search.fetch_url_metadata(query)
+        else:
+            logger.info(
+                "[CONTROLLER] [SEARCH] query='{}'  chat_id={}", query, chat_id,
+            )
+            result = await self._search.search(query)
 
         if result is None:
             logger.warning(
-                "[CONTROLLER] [SEARCH] No results  query='{}'  chat_id={}",
-                query, chat_id,
+                "[CONTROLLER] No result  query='{}'  chat_id={}", query, chat_id,
             )
             raise NoResultsError(query)
 
@@ -169,28 +187,39 @@ class PlaybackController:
             track.title, track.webpage_url,
         )
 
-        # ── Stage: ENQUEUE ────────────────────────────────────────────────
-        queue_size = await self._session.size(chat_id)
-        if queue_size >= self._max_q:
-            raise QueueFullError(
-                f"Queue is full ({self._max_q} tracks). "
-                "Wait for the current track to finish."
+        # ── Stage: ENQUEUE + START (per-chat lock) ────────────────────────
+        # The lock prevents two concurrent /play commands in the same idle
+        # chat from both seeing is_idle()==True and both calling _start_now().
+        # Different chats use different locks — full parallelism is preserved.
+        # Search runs outside the lock (slow I/O, already done above).
+        if chat_id not in self._play_locks:
+            self._play_locks[chat_id] = asyncio.Lock()
+
+        async with self._play_locks[chat_id]:
+            queue_size = await self._session.size(chat_id)
+            if queue_size >= self._max_q:
+                raise QueueFullError(
+                    f"Queue is full ({self._max_q} tracks). "
+                    "Wait for the current track to finish."
+                )
+
+            was_idle = self._state.is_idle(chat_id)
+            position = await self._session.enqueue(chat_id, track)
+            logger.info(
+                "[CONTROLLER] [ENQUEUE] title='{}'  chat_id={}  "
+                "position={}  was_idle={}",
+                track.title, chat_id, position, was_idle,
             )
 
-        was_idle = self._state.is_idle(chat_id)
-        position = await self._session.enqueue(chat_id, track)
-        logger.info(
-            "[CONTROLLER] [ENQUEUE] title='{}'  chat_id={}  "
-            "position={}  was_idle={}",
-            track.title, chat_id, position, was_idle,
-        )
-
-        # ── Start or queue ─────────────────────────────────────────────────
-        if was_idle:
-            await self._start_now(chat_id)
-            return track, True
-        else:
-            return track, False
+            if was_idle:
+                # _start_now holds the play lock for its full duration.
+                # This is intentional: a second /play must wait until we know
+                # whether the first track is PLAYING or failed, so the second
+                # /play sees the correct state and queues rather than starting.
+                await self._start_now(chat_id)
+                return track, True
+            else:
+                return track, False
 
     async def advance(self, chat_id: int) -> None:
         """
@@ -304,13 +333,20 @@ class PlaybackController:
             "[CONTROLLER] [JOIN VC] Joining voice chat  chat_id={}",
             chat_id,
         )
-        joined = await self._voice.play(chat_id, stream)
+        try:
+            joined = await self._voice.play(chat_id, stream)
+        except PrivateGroupError:
+            # Private group: assistant is not a member and cannot auto-join.
+            # Run cleanup (the track was already dequeued; state is still IDLE)
+            # then re-raise so the handler can show the specific "add assistant"
+            # message rather than the generic VC error.
+            await self._cleanup.cleanup(chat_id, reason="private_group")
+            raise
 
         if not joined:
-            # Wipe the session clean before raising.
-            # State is still IDLE — transition_to_playing was not reached.
-            # Cleanup clears the queue so the next /play starts from a
-            # clean slate instead of replaying the failed track.
+            # Generic VC failure (no active voice chat, permission denied, etc.)
+            # Wipe the session clean before raising so the next /play starts
+            # from a clean slate instead of replaying the failed track.
             await self._cleanup.cleanup(chat_id, reason="vc_join_failed")
             raise VoiceChatError(
                 "Could not join the voice chat. "
