@@ -59,8 +59,8 @@ _SEARCH_OPTS: Dict = {
     "default_search": "ytsearch",
     "skip_download":  True,
     "geo_bypass":     True,
-    "socket_timeout": 20,
-    "retries":        2,
+    "socket_timeout": 8,
+    "retries":        1,
     "extractor_args": {
         "youtube": {
             "player_client": ["mweb", "web"],

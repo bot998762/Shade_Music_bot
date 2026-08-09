@@ -21,11 +21,11 @@ DEFAULT_MAX_QUEUE_SIZE: int = 50
 DEFAULT_VOLUME:         int = 100
 
 # ── Timeouts (seconds) ────────────────────────────────────────────────────────
-SEARCH_TIMEOUT_SEC:         int = 30
-STREAM_RESOLVE_TIMEOUT_SEC: int = 45
+SEARCH_TIMEOUT_SEC:         int = 20
+STREAM_RESOLVE_TIMEOUT_SEC: int = 30
 
 # ── Thread executor ───────────────────────────────────────────────────────────
-YT_EXECUTOR_WORKERS:    int = 3
+YT_EXECUTOR_WORKERS:    int = 1
 YT_EXECUTOR_NAME:       str = "ytdlp"
 
 # ── Stream-end retry ──────────────────────────────────────────────────────────
