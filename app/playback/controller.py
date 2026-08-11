@@ -51,8 +51,8 @@ advance() workflow  (called by StreamMonitor on stream-end)
 3. [ADVANCE]   Dequeue next track
 4. [RESOLVE]   Resolve stream URL
 5. [FFMPEG]    Build MediaStream
-6. [ADVANCE]   voice.change_stream() → update state → notify
-7. [ADVANCE]   Retry up to MAX_SKIP_RETRIES on change_stream failure
+6. [ADVANCE]   voice.replace_stream() → update state → notify
+7. [ADVANCE]   Retry up to MAX_SKIP_RETRIES on replace_stream failure
 8. [ADVANCE]   Retries exhausted? → cleanup → IDLE
 
 _build_stream() failure modes (Phase-1 OOM fix)
@@ -308,7 +308,7 @@ class PlaybackController:
                     retries += 1
                     continue
 
-                changed = await self._voice.change_stream(chat_id, stream)
+                changed = await self._voice.replace_stream(chat_id, stream)
 
                 if changed:
                     self._state.update_current_track(chat_id, next_track)
@@ -320,10 +320,10 @@ class PlaybackController:
                     await self._send_now_playing(chat_id, next_track)
                     return
 
-                # ── change_stream failed — retry with next track ───────────
+                # ── replace_stream failed — retry with next track ──────────
                 retries += 1
                 logger.warning(
-                    "[CONTROLLER] [ADVANCE] change_stream failed for '{}' "
+                    "[CONTROLLER] [ADVANCE] replace_stream failed for '{}' "
                     "(attempt {}/{})  chat_id={}",
                     next_track.title, retries, MAX_SKIP_RETRIES, chat_id,
                 )

@@ -22,6 +22,22 @@ Imports that work:
     from pytgcalls.types import Update, ChatUpdate, MediaStream, AudioQuality
     from pytgcalls.types.stream import StreamEnded as StreamAudioEnded
 
+Methods available on PyTgCalls in 2.x:
+    play(chat_id, stream)       — join VC and START stream, OR REPLACE existing stream.
+                                  In 2.x, play() is dual-purpose: calling it on an
+                                  already-streaming chat replaces the current stream.
+                                  change_stream() was REMOVED in the 2.x rewrite.
+    leave_call(chat_id)         — leave the VC
+    pause_stream(chat_id)       — pause
+    resume_stream(chat_id)      — resume
+    start()                     — engine start
+    on_update(filter?)          — decorator for event callbacks
+
+NOTE: change_stream() does NOT exist in py-tgcalls 2.x.
+It was present in 0.x / 1.x.  In 2.x, play() replaces it entirely.
+Using play() to replace a stream does NOT fire StreamAudioEnded —
+ntgcalls/WebRTC simply swaps the input; no "end" event is generated.
+
 ChatUpdate.Status values:
     CLOSED_VOICE_CHAT   — GroupCallDiscarded (admin ended the VC)
     KICKED              — ChannelForbidden / ChatForbidden (bot removed)
@@ -213,11 +229,13 @@ class VoiceChatManager:
             exc_type = type(exc).__name__
 
             if _match(exc, _ALREADY_JOINED):
+                # In py-tgcalls 2.x, play() IS the stream-replacement API.
+                # If it raises "already joined" that is unexpected; try once more.
                 logger.debug(
-                    "[VOICE] Already in call ({}), switching stream  chat_id={}",
+                    "[VOICE] Already in call ({}), retrying play()  chat_id={}",
                     exc_type, chat_id,
                 )
-                return await self.change_stream(chat_id, stream)
+                return await self.replace_stream(chat_id, stream)
 
             if _match(exc, _NO_CALL):
                 logger.warning(
@@ -232,24 +250,41 @@ class VoiceChatManager:
             )
             return False
 
-    async def change_stream(self, chat_id: int, stream: MediaStream) -> bool:
+    async def replace_stream(self, chat_id: int, stream: MediaStream) -> bool:
         """
-        Replace the currently running stream (used for skip / auto-advance).
+        Replace the currently running stream for auto-advance and skip.
 
-        Falls back to a fresh play() if the bot is not in the VC.
+        In py-tgcalls 2.x, play() is the only method for stream replacement.
+        change_stream() was removed in the 2.x rewrite.
 
-        Stage log: [VOICE] change
+        When the stream ends naturally (StreamAudioEnded), the VC connection
+        itself is still alive — ntgcalls keeps the WebRTC session open even
+        after a stream finishes.  Calling play() on an active VC connection
+        replaces the stream without leaving/rejoining.
+
+        If play() reports "not in VC" (edge case: VC was closed between the
+        stream ending and advance() running), falls back to a full join.
+
+        Stage log: [VOICE] replace
         """
+        logger.info(
+            "[VOICE] Replacing stream (py-tgcalls 2.x play() API)  chat_id={}",
+            chat_id,
+        )
         try:
-            await self._tgcalls.change_stream(chat_id, stream)
+            await self._tgcalls.play(chat_id, stream)
             self._active.add(chat_id)
-            logger.debug("[VOICE] Stream changed  chat_id={}", chat_id)
+            logger.info("[VOICE] Stream replaced via play()  chat_id={}", chat_id)
             return True
 
         except Exception as exc:
+            exc_type = type(exc).__name__
+
             if _match(exc, _NO_CALL):
+                # VC was closed externally between the stream ending and advance().
+                # Try a full join+play as recovery.
                 logger.warning(
-                    "[VOICE] Not in VC during change_stream, attempting join  "
+                    "[VOICE] Not in VC during replace_stream — attempting full join  "
                     "chat_id={}  error={}",
                     chat_id, exc,
                 )
@@ -257,19 +292,21 @@ class VoiceChatManager:
                 try:
                     await self._tgcalls.play(chat_id, stream)
                     self._active.add(chat_id)
+                    logger.info(
+                        "[VOICE] Full join recovery succeeded  chat_id={}", chat_id
+                    )
                     return True
                 except Exception as exc2:
                     logger.error(
-                        "[VOICE] Fresh join after change_stream failure  "
-                        "chat_id={}  error={}",
+                        "[VOICE] Full join recovery failed  chat_id={}  error={}",
                         chat_id, exc2,
                     )
                     self._active.discard(chat_id)
                     return False
 
             logger.error(
-                "[VOICE] change_stream failed  chat_id={}  type={}  error={}",
-                chat_id, type(exc).__name__, exc,
+                "[VOICE] replace_stream (play) failed  chat_id={}  type={}  error={}",
+                chat_id, exc_type, exc,
             )
             return False
 
@@ -308,8 +345,11 @@ class VoiceChatManager:
         """
         Mark a manual skip as in-progress.
 
-        Suppresses the StreamAudioEnded event fired by change_stream() so the
-        queue is not double-advanced.
+        Suppresses the StreamAudioEnded event fired after a stream finishes
+        so the queue is not double-advanced.
+        Note: in py-tgcalls 2.x, play() used for stream replacement does NOT
+        fire StreamAudioEnded, so begin_skip() is only needed for explicit
+        /skip commands that call leave+rejoin.
         """
         self._skip_in_progress.add(chat_id)
 
