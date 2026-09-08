@@ -11,8 +11,8 @@ Hierarchy
 ShadeBotError
 ├── SearchError
 │   └── NoResultsError
-├── StreamResolveError
-│   └── StreamResolveTimeoutError   ← Phase-1 OOM fix: timeout ≠ failure
+├── StreamResolveError          ← yt-dlp could not produce a stream URL
+│   └── StreamResolveTimeoutError  ← resolver timed out; subprocess killed
 ├── VoiceChatError
 │   ├── NoActiveVoiceChatError
 │   └── PrivateGroupError
@@ -34,35 +34,36 @@ class SearchError(ShadeBotError):
 
 
 class NoResultsError(SearchError):
-    """Raised when a search returns zero results."""
+    """Raised when a search returns zero results or metadata fetch fails."""
 
 
 # ── Stream resolution ─────────────────────────────────────────────────────────
 
 class StreamResolveError(ShadeBotError):
-    """Raised when a direct audio CDN URL cannot be resolved."""
+    """
+    Raised when yt-dlp cannot extract a playable stream URL.
+
+    Distinct from NoResultsError — the track was found (metadata exists)
+    but the CDN audio URL could not be obtained.  The video may be
+    unavailable, age-restricted, geo-blocked, or affected by a yt-dlp
+    API change.
+
+    Handlers should show "stream unavailable" — NOT "no results found".
+    """
 
 
 class StreamResolveTimeoutError(StreamResolveError):
     """
-    Raised when resolver.resolve() times out via asyncio.TimeoutError.
+    Raised when the yt-dlp subprocess exceeds STREAM_RESOLVE_TIMEOUT_SEC.
 
-    CRITICAL DISTINCTION (Phase-1 OOM fix):
-    This is NOT the same as a DownloadError / extraction failure.
+    The subprocess (yt-dlp + its Deno child) is killed via SIGTERM to
+    the process group before this exception is raised.  No ghost processes
+    remain after the exception is caught.
 
-    - DownloadError  → fallback to FFmpegStreamBuilder.build_from_youtube() is ALLOWED.
-    - TimeoutError   → fallback is FORBIDDEN.
-
-    Why: When asyncio.wait_for() cancels the Future, the underlying
-    ThreadPoolExecutor thread continues running yt-dlp + Deno.  If the
-    controller immediately falls back to build_from_youtube(), ntgcalls
-    spawns a second yt-dlp + second Deno + FFmpeg while the ghost thread's
-    yt-dlp + Deno are still alive.  On Render's 512 MB limit this causes
-    OOM (SIGKILL / exit 137).
-
-    Catching this exception and NOT falling back eliminates the duplicate
-    process overlap.  The ghost thread's memory (~90–180 MB) is no longer
-    compounded by a second extraction peak (~120–240 MB).
+    This is a subclass of StreamResolveError so callers that catch
+    StreamResolveError also catch this.  Callers that need to distinguish
+    the timeout case (e.g. to show "try again" vs "video unavailable")
+    must catch StreamResolveTimeoutError FIRST (more specific → less specific).
     """
 
 

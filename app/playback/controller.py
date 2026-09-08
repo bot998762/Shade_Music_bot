@@ -55,18 +55,32 @@ advance() workflow  (called by StreamMonitor on stream-end)
 7. [ADVANCE]   Retry up to MAX_SKIP_RETRIES on replace_stream failure
 8. [ADVANCE]   Retries exhausted? → cleanup → IDLE
 
-_build_stream() failure modes (Phase-1 OOM fix)
-------------------------------------------------
-resolver.resolve() now raises StreamResolveTimeoutError on asyncio timeout
-instead of returning None.  This lets _build_stream() distinguish:
+_build_stream() failure modes
+------------------------------
+resolver.resolve() raises StreamResolveTimeoutError on asyncio timeout.
+resolver.resolve() returns None on genuine yt-dlp extraction failure.
 
   SUCCESS (str returned)              → primary CDN path
-  DOWNLOAD_ERROR (None returned)      → fallback allowed (thread exited)
-  TIMEOUT (StreamResolveTimeoutError) → fallback FORBIDDEN (ghost thread)
+  FAILURE (None returned)             → raises StreamResolveError
+  TIMEOUT (StreamResolveTimeoutError) → re-raised as-is
 
-On timeout, _build_stream() re-raises StreamResolveTimeoutError.
-_start_now() and advance() propagate it to the handler / cleanup path.
-No yt-dlp subprocess is spawned via ntgcalls on the timeout path.
+Why the ntgcalls fallback was removed
+--------------------------------------
+The previous implementation fell back to FFmpegStreamBuilder.build_from_youtube()
+when resolver returned None.  build_from_youtube() passes the URL to ntgcalls
+which runs yt-dlp + Deno + FFmpeg internally.  When ntgcalls raised YtDlpError
+(its internal yt-dlp timeout), those child processes were NOT killed by
+leave_call().  Across multiple tracks / concurrent chats, they accumulated:
+
+  2 chats × (yt-dlp ~100 MB + Deno ~80 MB + FFmpeg ~30 MB) ≈ 420 MB
+  + bot base ~150 MB = ~570 MB → OOM SIGKILL on Render 512 MB
+
+The fallback also produced a misleading "Could not join voice chat" error
+when the real failure was stream extraction.
+
+The fix: when resolver returns None, raise StreamResolveError immediately.
+No new processes are spawned.  The user receives a specific "stream unavailable"
+message.  Memory stays bounded.
 
 Stage log: [CONTROLLER]
 """
@@ -89,6 +103,7 @@ from app.shared.exceptions import (
     NoResultsError,
     PrivateGroupError,
     QueueFullError,
+    StreamResolveError,
     StreamResolveTimeoutError,
     VoiceChatError,
 )
@@ -116,7 +131,7 @@ class PlaybackController:
     cleanup:      CleanupService instance.
     notify:       Optional async callable — sends "Now Playing" messages.
     max_queue:    Hard cap on upcoming tracks per chat.
-    cookies_path: Passed to the FFmpeg fallback path.
+    cookies_path: Kept for interface compatibility; not used by resolver.
     """
 
     def __init__(
@@ -145,9 +160,6 @@ class PlaybackController:
         self._advance_locks: Dict[int, asyncio.Lock] = {}
         # One play lock per chat — prevents concurrent /play commands in the
         # same idle chat from each calling _start_now() simultaneously.
-        # The search stage (slow I/O) runs BEFORE acquiring this lock so
-        # unrelated chats and even concurrent searches in the same chat are
-        # never serialised.  Different chats use different locks.
         self._play_locks: Dict[int, asyncio.Lock] = {}
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -171,19 +183,22 @@ class PlaybackController:
         Raises
         ------
         NoResultsError
-            When the search returns no results.
+            When the search/metadata fetch returns no results.
         QueueFullError
             When the chat's queue is at its limit.
+        StreamResolveError
+            When yt-dlp cannot extract a playable stream URL.
+            Show "stream unavailable" — not "no results found".
         StreamResolveTimeoutError
-            When the resolver times out.  Fallback was suppressed.
+            When the resolver times out.  Fallback suppressed.
             The caller should show a "try again" message.
         VoiceChatError
             When the VC join fails.
         """
         # ── Stage: SEARCH or DIRECT-URL FETCH ────────────────────────
         # For a direct URL: skip the ytsearch1: round-trip and fetch metadata
-        # directly.  The CDN stream URL is still resolved by _build_stream()
-        # at play time — same path as for search results.
+        # directly.  The CDN stream URL is resolved by _build_stream() at play
+        # time — same path as for search results.
         if is_direct_url(query):
             logger.info(
                 "[CONTROLLER] [FETCH_URL] Direct URL  url='{}'  chat_id={}",
@@ -210,10 +225,6 @@ class PlaybackController:
         )
 
         # ── Stage: ENQUEUE + START (per-chat lock) ────────────────────────
-        # The lock prevents two concurrent /play commands in the same idle
-        # chat from both seeing is_idle()==True and both calling _start_now().
-        # Different chats use different locks — full parallelism is preserved.
-        # Search runs outside the lock (slow I/O, already done above).
         if chat_id not in self._play_locks:
             self._play_locks[chat_id] = asyncio.Lock()
 
@@ -234,10 +245,6 @@ class PlaybackController:
             )
 
             if was_idle:
-                # _start_now holds the play lock for its full duration.
-                # This is intentional: a second /play must wait until we know
-                # whether the first track is PLAYING or failed, so the second
-                # /play sees the correct state and queues rather than starting.
                 await self._start_now(chat_id)
                 return track, True
             else:
@@ -248,12 +255,6 @@ class PlaybackController:
         Auto-advance to the next queued track after the current one ends.
 
         Called exclusively by StreamMonitor when a stream-end event fires.
-        StreamMonitor is a passive observer — it fires this method and returns.
-        All decisions about what to play next are made here.
-
-        Lock-protected per chat_id so concurrent StreamAudioEnded events
-        (which PyTgCalls can fire for the same chat under some conditions)
-        do not double-advance the queue.
 
         Stage log: [CONTROLLER] [ADVANCE]
         """
@@ -294,15 +295,21 @@ class PlaybackController:
                 try:
                     stream = await self._build_stream(next_track)
                 except StreamResolveTimeoutError:
-                    # Timeout during advance: do NOT fall back (OOM risk).
-                    # Log clearly and treat this advance attempt as a failure,
-                    # but do NOT trigger cleanup — the VC may still be active
-                    # from the previous track.  Count as a retry so we can
-                    # skip forward or give up gracefully.
+                    # Timeout: yt-dlp subprocess was killed; no ghost processes.
+                    # Skip this track and try the next.
                     logger.error(
                         "[CONTROLLER] [ADVANCE] Resolver timeout for '{}' — "
-                        "fallback suppressed; counting as skip attempt {}/{}  "
-                        "chat_id={}",
+                        "skipping (attempt {}/{})  chat_id={}",
+                        next_track.title, retries + 1, MAX_SKIP_RETRIES, chat_id,
+                    )
+                    retries += 1
+                    continue
+                except StreamResolveError:
+                    # Genuine extraction failure — track is unplayable.
+                    # Skip to the next track.
+                    logger.error(
+                        "[CONTROLLER] [ADVANCE] Stream unavailable for '{}' — "
+                        "skipping (attempt {}/{})  chat_id={}",
                         next_track.title, retries + 1, MAX_SKIP_RETRIES, chat_id,
                     )
                     retries += 1
@@ -350,9 +357,11 @@ class PlaybackController:
 
         Called by play() when the chat was idle — first track in a new session.
 
-        On resolver timeout: runs cleanup() and re-raises StreamResolveTimeoutError.
-        On VC join failure: runs cleanup() and raises VoiceChatError.
-        State remains IDLE in both cases. The next /play starts clean.
+        On resolver timeout:  runs cleanup() and re-raises StreamResolveTimeoutError.
+        On resolver failure:  runs cleanup() and re-raises StreamResolveError.
+        On VC join failure:   runs cleanup() and raises VoiceChatError.
+
+        State remains IDLE in all failure cases. The next /play starts clean.
 
         Stage log: [RESOLVE] [FFMPEG] [JOIN VC] [PLAY]
         """
@@ -368,15 +377,21 @@ class PlaybackController:
         try:
             stream = await self._build_stream(track)
         except StreamResolveTimeoutError:
-            # Timeout: fallback suppressed.  Clean up the dequeued track
-            # so state is IDLE and the next /play starts fresh.
             logger.error(
-                "[CONTROLLER] Resolver timeout — fallback disabled  "
+                "[CONTROLLER] Resolver timeout — track unplayable  "
                 "title='{}'  chat_id={}",
                 track.title, chat_id,
             )
             await self._cleanup.cleanup(chat_id, reason="resolver_timeout")
-            raise  # propagates to play() → handler shows user-facing message
+            raise
+        except StreamResolveError:
+            logger.error(
+                "[CONTROLLER] Stream unavailable — track unplayable  "
+                "title='{}'  chat_id={}",
+                track.title, chat_id,
+            )
+            await self._cleanup.cleanup(chat_id, reason="resolver_failed")
+            raise
 
         # ── Stage: JOIN VC ────────────────────────────────────────────────
         logger.info(
@@ -386,17 +401,10 @@ class PlaybackController:
         try:
             joined = await self._voice.play(chat_id, stream)
         except PrivateGroupError:
-            # Private group: assistant is not a member and cannot auto-join.
-            # Run cleanup (the track was already dequeued; state is still IDLE)
-            # then re-raise so the handler can show the specific "add assistant"
-            # message rather than the generic VC error.
             await self._cleanup.cleanup(chat_id, reason="private_group")
             raise
 
         if not joined:
-            # Generic VC failure (no active voice chat, permission denied, etc.)
-            # Wipe the session clean before raising so the next /play starts
-            # from a clean slate instead of replaying the failed track.
             await self._cleanup.cleanup(chat_id, reason="vc_join_failed")
             raise VoiceChatError(
                 "Could not join the voice chat. "
@@ -416,16 +424,23 @@ class PlaybackController:
         Resolve a playable MediaStream for *track*.
 
         Single implementation — used by both _start_now() and advance().
-        This is the only place stream resolution and MediaStream creation occur.
+        This is the ONLY place stream resolution and MediaStream creation occur.
 
-        Primary:  StreamResolver → direct CDN URL → FFmpegStreamBuilder.build_from_url()
-        Fallback: FFmpegStreamBuilder.build_from_youtube() — ONLY on genuine
-                  extraction failure (resolver returns None).  NEVER on timeout.
+        Primary path only: StreamResolver → direct CDN URL →
+        FFmpegStreamBuilder.build_from_url().
+
+        The ntgcalls yt-dlp fallback (build_from_youtube) has been removed.
+        It spawned unmanaged yt-dlp+Deno+FFmpeg subprocesses that were not
+        killed by leave_call(), causing cumulative OOM on Render 512 MB.
+        When the resolver cannot produce a URL, StreamResolveError is raised
+        and the user sees a specific "stream unavailable" message.
 
         Raises
         ------
         StreamResolveTimeoutError
-            Propagated from resolver.resolve().  Caller MUST NOT fall back.
+            Propagated from resolver.resolve().
+        StreamResolveError
+            When resolver returns None (yt-dlp extraction failed).
 
         Stage log: [RESOLVE] [FFMPEG]
         """
@@ -441,16 +456,22 @@ class PlaybackController:
             logger.info("[CONTROLLER] [FFMPEG] Building MediaStream from direct URL")
             return FFmpegStreamBuilder.build_from_url(direct_url)
 
-        # direct_url is None → genuine extraction failure (DownloadError etc.)
-        # The executor thread has already exited; no ghost process is running.
-        # Fallback is safe here.
-        logger.warning(
-            "[CONTROLLER] [RESOLVE] Resolver returned None for '{}' — "
-            "using fallback (genuine extraction failure, not timeout)",
-            track.title,
+        # direct_url is None → yt-dlp exited non-zero (video unavailable,
+        # age-restricted, geo-blocked, or API change).
+        #
+        # IMPORTANT: we do NOT fall back to FFmpegStreamBuilder.build_from_youtube()
+        # here.  That fallback spawned ntgcalls-internal yt-dlp+Deno+FFmpeg that
+        # were never properly cleaned up, causing OOM after ~2-4 tracks.
+        # Instead: raise StreamResolveError so the caller can show a clear message.
+        logger.error(
+            "[CONTROLLER] [RESOLVE] yt-dlp returned no URL for '{}' — "
+            "video may be unavailable/restricted  title='{}'",
+            track.webpage_url, track.title,
         )
-        logger.warning("[CONTROLLER] [FFMPEG] Building fallback MediaStream")
-        return FFmpegStreamBuilder.build_from_youtube(track.webpage_url, self._cookies)
+        raise StreamResolveError(
+            f"Could not extract a stream URL for: {track.webpage_url!r}. "
+            "The video may be unavailable, age-restricted, or geo-blocked."
+        )
 
     async def _send_now_playing(self, chat_id: int, track: Track) -> None:
         """

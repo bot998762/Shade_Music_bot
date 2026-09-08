@@ -19,6 +19,19 @@ No YouTube search calls.
 No stream resolution.
 No voice chat logic.
 The handler only calls PlaybackController — nothing else.
+
+Error classification
+--------------------
+NoResultsError          → "No results found"        (search returned nothing)
+StreamResolveError      → "Could not extract stream" (yt-dlp failed on a valid URL)
+StreamResolveTimeoutError → "Timed out, try again"   (subprocess killed cleanly)
+VoiceChatError          → "Could not join VC"        (Telegram/WebRTC issue)
+PrivateGroupError       → "Add assistant to group"   (private group)
+
+IMPORTANT: StreamResolveError must be caught BEFORE VoiceChatError because
+StreamResolveError is not a subclass of VoiceChatError (they are siblings).
+StreamResolveTimeoutError must be caught BEFORE StreamResolveError because
+it IS a subclass of StreamResolveError.
 """
 
 from __future__ import annotations
@@ -44,6 +57,7 @@ from app.shared.errors import (
     PLAY_PRIVATE_GROUP,
     PLAY_QUEUE_FULL,
     PLAY_RATE_LIMITED,
+    PLAY_STREAM_FAILED,
     PLAY_STREAM_TIMEOUT,
     PLAY_UNEXPECTED_ERROR,
     SEARCHING,
@@ -52,6 +66,7 @@ from app.shared.exceptions import (
     NoResultsError,
     PrivateGroupError,
     QueueFullError,
+    StreamResolveError,
     StreamResolveTimeoutError,
     VoiceChatError,
 )
@@ -126,8 +141,6 @@ def register(client: Client, controller: PlaybackController) -> None:
             return
 
         # ── Interim message ────────────────────────────────────────────────
-        # Show a URL-specific message when loading a direct link so the
-        # interim doesn't read "Searching for https://..."
         if is_direct_url(query):
             interim = await msg.reply_text(LOADING_URL, quote=True)
         else:
@@ -145,21 +158,32 @@ def register(client: Client, controller: PlaybackController) -> None:
                 requested_by_name=user.first_name or user.username or "Unknown",
             )
         except NoResultsError:
+            # Search returned no results OR direct-URL metadata fetch failed.
+            # This is NOT the right message for stream extraction failures.
             await interim.edit_text(PLAY_NO_RESULTS.format(query=query))
             return
         except QueueFullError as exc:
             await interim.edit_text(str(exc))
             return
         except StreamResolveTimeoutError:
-            # Resolver timed out — fallback was suppressed (OOM prevention).
-            # The ghost executor thread may still be running; no new yt-dlp
-            # process was spawned.  Ask the user to retry; by the time they do,
-            # the ghost thread has likely finished and the executor is free.
+            # Resolver timed out — yt-dlp subprocess was killed cleanly.
+            # No ghost processes remain.  Ask the user to retry.
             logger.warning(
                 "[PLAY] Stream resolution timed out  chat_id={}  query='{}'",
                 msg.chat.id, query,
             )
             await interim.edit_text(PLAY_STREAM_TIMEOUT)
+            return
+        except StreamResolveError:
+            # yt-dlp could not extract a stream URL (video unavailable,
+            # age-restricted, geo-blocked, etc.).
+            # Must be caught AFTER StreamResolveTimeoutError (subclass).
+            # Must be caught BEFORE VoiceChatError (different hierarchy).
+            logger.warning(
+                "[PLAY] Stream extraction failed  chat_id={}  query='{}'",
+                msg.chat.id, query,
+            )
+            await interim.edit_text(PLAY_STREAM_FAILED)
             return
         except PrivateGroupError:
             # Must be caught before VoiceChatError (it is a subclass).

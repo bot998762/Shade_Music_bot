@@ -49,6 +49,16 @@ PLAY_UNEXPECTED_ERROR = (
     "❌ An unexpected error occurred. Please try again."
 )
 
+PLAY_STREAM_TIMEOUT = (
+    "❌ Stream resolution timed out. Please try again in a moment."
+)
+
+PLAY_STREAM_FAILED = (
+    "❌ Could not extract the audio stream.\n\n"
+    "The video may be unavailable, age-restricted, or region-locked. "
+    "Please try a different song."
+)
+
 # ── Now playing ───────────────────────────────────────────────────────────────
 NOW_PLAYING = (
     "🎵 **Now Playing**\n\n"
@@ -67,7 +77,3 @@ ADDED_TO_QUEUE = (
 # ── General ───────────────────────────────────────────────────────────────────
 SEARCHING    = "🔍 Searching for **{query}**…"
 LOADING_URL  = "⏳ Loading URL…"
-
-PLAY_STREAM_TIMEOUT = (
-    "❌ Stream resolution timed out. Please try again."
-)

@@ -1,7 +1,7 @@
 """
 app.search.resolver
 ~~~~~~~~~~~~~~~~~~~
-Stream URL resolution via yt-dlp — full extraction, no searching.
+Stream URL resolution via yt-dlp subprocess — proper kill on timeout.
 
 Responsibility
 --------------
@@ -9,63 +9,53 @@ Accept a permanent YouTube watch URL.
 Return a direct CDN audio URL (e.g. rr*.googlevideo.com/...).
 Nothing more.
 
-Why this is separate from search/youtube.py
--------------------------------------------
-Search (metadata-only, fast) and stream resolution (full extraction, slower)
-are different operations with different options, timeouts, and failure modes.
-Separating them keeps each module small and single-purpose, and avoids
-triggering full CDN resolution at search time (CDN URLs expire in ~6 h).
+Subprocess approach (Phase-2 OOM fix)
+--------------------------------------
+Phase 1 used ThreadPoolExecutor + asyncio.wait_for().  When asyncio timed
+out, it cancelled the Future but the executor thread continued running yt-dlp
++ Deno ("ghost thread"), holding ~100–200 MB for 20–60 s after the timeout.
+
+Phase 2 uses asyncio.create_subprocess_exec().  When asyncio.wait_for()
+times out, it cancels the coroutine _resolve_subprocess() by raising
+CancelledError at the ``await proc.communicate()`` line.  Our except-clause
+then calls _kill_proc_group() which sends SIGTERM to the yt-dlp process group
+(yt-dlp + its Deno child).  No ghost processes, no leaked memory.
+
+Format selection fix
+--------------------
+The previous implementation omitted the format selector and relied on manual
+parsing of info["formats"].  yt-dlp's internal default selector
+(bestvideo*+bestaudio/best) raised "Requested format is not available" when
+the mweb/web/tv_embedded player clients return audio-only or restricted-format
+lists (confirmed in production logs).
+
+``--format "bestaudio[acodec!=none]/best[acodec!=none]/best"`` tells yt-dlp to
+select the best audio-only stream with an actual codec (DASH audio), falling
+back to the best muxed format with audio, then any best format.  Combined with
+``--print url``, yt-dlp outputs just the direct CDN URL — no JSON parsing.
+
+Concurrency limit
+-----------------
+Each yt-dlp + Deno subprocess uses ~100–200 MB peak.  The bot base is ~150 MB.
+Two concurrent subprocesses would exceed Render's 512 MB limit.  A module-level
+asyncio.Semaphore(1) serialises concurrent resolve() calls — the second chat
+waits rather than causing OOM.
 
 Player client strategy
 ----------------------
-``mweb`` (YouTube Mobile Web) is the primary client.
+mweb (YouTube Mobile Web) is primary.  yt-dlp automatically generates PO
+tokens for mweb via Deno + yt-dlp-ejs when Deno is on PATH (installed in our
+Dockerfile).  web is secondary (same PO-token path).  tv_embedded is a last-
+resort fallback for edge cases.
 
-Since yt-dlp 2025.11.12, YouTube enforces Proof-of-Origin (PO) tokens
-for all Innertube clients when requests originate from data-centre IP
-ranges (Render, VPS, CI).  This now includes ``tv_embedded``
-(TVHTML5_SIMPLY_EMBEDDED_PLAYER), which was previously exempt but is
-no longer reliable from server IPs as of mid-2026.
+iOS and Android are excluded: yt-dlp cannot auto-generate PO tokens for native
+app clients from server IPs.
 
-``mweb`` and ``web`` are the correct primary clients because:
-  - yt-dlp automatically uses Deno + yt-dlp-ejs to generate PO tokens
-    for these clients when Deno is on PATH (which it is — installed to
-    /usr/local/bin/deno in our Dockerfile).
-  - No explicit PO-token configuration is needed; yt-dlp handles it.
-  - ``mweb`` (mobile web) typically faces less aggressive bot detection
-    from server IPs than the desktop ``web`` client.
-  - ``tv_embedded`` is retained as a tertiary fallback for edge cases
-    where the embed API still responds correctly.
-
-``ios`` and ``android`` are removed: both require PO tokens on server
-IPs and yt-dlp does not auto-generate PO tokens for native app clients,
-so they always fail from Render.
-
-Format note: ``mweb`` returns muxed or DASH streams depending on the
-video.  Priority 1 (audio-only) handles DASH; Priority 2 (muxed with
-audio) handles muxed.  FFmpeg/ntgcalls extracts the audio track either
-way.
-
-Why Python-layer resolution beats MediaStream(ytdlp_parameters=...)
--------------------------------------------------------------------
-ntgcalls 2.2.5 accepts ytdlp_parameters as a string but does NOT forward
---cookies to its internal yt-dlp invocation.  Cookies applied as a Python
-dict option (cookiefile="...") in this module DO work correctly.
-Resolving the CDN URL here hands ntgcalls a direct https://... URL that
-requires zero authentication — yt-dlp runs zero times inside ntgcalls.
-
-Failure modes (Phase-1 OOM fix)
---------------------------------
-resolve() previously returned None for BOTH timeout and extraction failure.
-This was ambiguous and caused the OOM: the controller could not distinguish
-a timeout (ghost thread still running) from a genuine DownloadError (thread
-already exited cleanly).  With None, it always fell back to
-FFmpegStreamBuilder.build_from_youtube() — launching a second yt-dlp + Deno
-while the ghost thread's copies were still alive.
-
-New contract:
-  SUCCESS         → returns the direct CDN URL string (str)
-  DOWNLOAD ERROR  → returns None  (caller may fall back — thread already done)
-  TIMEOUT         → raises StreamResolveTimeoutError  (caller MUST NOT fall back)
+Contract
+--------
+  SUCCESS   → str  (direct CDN URL)
+  FAILURE   → None (yt-dlp exited non-zero; caller raises StreamResolveError)
+  TIMEOUT   → raises StreamResolveTimeoutError (yt-dlp process killed)
 
 Stage log: [RESOLVE]
 """
@@ -74,62 +64,36 @@ from __future__ import annotations
 
 import asyncio
 import os
-from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Optional
-
-import yt_dlp
-import yt_dlp.utils
+import signal
+from typing import Optional
 
 from app.infrastructure.logger import logger
 from app.shared.constants import (
     COOKIES_SECRETS_DIR,
     COOKIES_TMP_DIR,
     STREAM_RESOLVE_TIMEOUT_SEC,
-    YT_EXECUTOR_NAME,
-    YT_EXECUTOR_WORKERS,
 )
 from app.shared.exceptions import StreamResolveTimeoutError
 
-# ── Thread executor ────────────────────────────────────────────────────────────
-# Separate executor from search so a slow resolution doesn't block searches.
-_RESOLVE_EXECUTOR = ThreadPoolExecutor(
-    max_workers=YT_EXECUTOR_WORKERS,
-    thread_name_prefix=f"{YT_EXECUTOR_NAME}_resolve",
-)
+# ── Format selector ────────────────────────────────────────────────────────────
+# Priority 1: best audio-only stream with an actual codec (DASH opus/m4a)
+# Priority 2: best overall format that carries audio (muxed mp4/webm)
+# Priority 3: absolute best — last resort when nothing else matches
+#
+# This replaces the old "no format selector" approach that triggered yt-dlp's
+# default bestvideo*+bestaudio/best selector, which raised
+# "Requested format is not available" with mweb/web/tv_embedded clients.
+_YDL_FORMAT = "bestaudio[acodec!=none]/best[acodec!=none]/best"
 
-# ── yt-dlp options for full extraction ────────────────────────────────────────
-# mweb is first: YouTube Mobile Web client.  When Deno is on PATH and
-# yt-dlp-ejs is installed (both are true in our Docker image), yt-dlp
-# automatically generates a PO token via Deno for this client.  This is
-# the correct bypass for Render's data-centre IP range as of yt-dlp 2026.x.
-#
-# web is second: standard desktop client.  Same Deno/PO-token generation
-# path as mweb; returns DASH audio-only streams (Priority 1 in _sync_resolve).
-#
-# tv_embedded is third: the embedded-player endpoint.  Previously exempt from
-# PO tokens but now blocked from many data-centre IPs.  Retained as a
-# last-resort fallback for edge cases where it still responds correctly.
-#
-# ios and android are REMOVED: they require PO tokens but yt-dlp does not
-# auto-generate PO tokens for native app clients — they always fail on Render.
-#
-# NO format selector — we fetch ALL formats and manually select the best
-# audio stream, so we are never bound to a format ID that may disappear.
-_STREAM_OPTS: Dict = {
-    "quiet":         True,
-    "no_warnings":   True,
-    "noplaylist":    True,
-    "skip_download": True,
-    "geo_bypass":    True,
-    "socket_timeout": 10,
-    "retries":        1,
-    # format intentionally omitted — manual selection in _sync_resolve()
-    "extractor_args": {
-        "youtube": {
-            "player_client": ["mweb", "web", "tv_embedded"],
-        }
-    },
-}
+# ── Player clients ─────────────────────────────────────────────────────────────
+_PLAYER_CLIENTS = "mweb,web,tv_embedded"
+
+# ── Concurrency gate ───────────────────────────────────────────────────────────
+# Limits simultaneous yt-dlp subprocesses to 1.
+# Each subprocess (yt-dlp + Deno) peaks at ~100–200 MB.
+# With the bot base at ~150 MB, two concurrent subprocesses exceed 512 MB.
+# Callers wait inside resolve(); the second chat is not dropped, only delayed.
+_RESOLVE_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(1)
 
 
 class StreamResolver:
@@ -162,151 +126,162 @@ class StreamResolver:
         str
             The direct https://... CDN URL on success.
         None
-            On genuine extraction failure (DownloadError, format not found,
-            etc.).  The caller MAY fall back to FFmpegStreamBuilder in this
-            case because the executor thread has already exited cleanly.
+            On genuine extraction failure (yt-dlp exited non-zero, format
+            not available, video private/deleted, etc.).
 
         Raises
         ------
         StreamResolveTimeoutError
-            When asyncio.wait_for() times out.  The caller MUST NOT fall
-            back — the underlying executor thread is still running yt-dlp
-            + Deno and falling back would create a second yt-dlp + Deno +
-            FFmpeg stack, causing the confirmed OOM on Render 512 MB.
+            When asyncio.wait_for() times out.  The yt-dlp process was killed
+            via SIGTERM to its process group.  No ghost processes remain.
 
         Stage log: [RESOLVE]
         """
         logger.debug("[RESOLVE] Resolving stream URL for: {}", webpage_url)
-        loop = asyncio.get_running_loop()
-        try:
-            url = await asyncio.wait_for(
-                loop.run_in_executor(
-                    _RESOLVE_EXECUTOR,
-                    self._sync_resolve,
+
+        async with _RESOLVE_SEMAPHORE:
+            try:
+                url = await asyncio.wait_for(
+                    self._resolve_subprocess(webpage_url),
+                    timeout=STREAM_RESOLVE_TIMEOUT_SEC,
+                )
+                if url:
+                    logger.info(
+                        "[RESOLVE] OK  url_preview={}...",
+                        url[:60],
+                    )
+                else:
+                    logger.warning(
+                        "[RESOLVE] No direct URL found for '{}'", webpage_url,
+                    )
+                return url
+            except asyncio.TimeoutError:
+                # yt-dlp subprocess was killed by _kill_proc_group() inside
+                # _resolve_subprocess()'s except-clause before re-raising
+                # CancelledError.  asyncio.wait_for() converts that to
+                # TimeoutError here.  No ghost processes remain.
+                logger.error(
+                    "[RESOLVE] Timed out for '{}' — "
+                    "yt-dlp subprocess killed; no ghost processes",
                     webpage_url,
-                ),
-                timeout=STREAM_RESOLVE_TIMEOUT_SEC,
-            )
-            if url:
-                logger.info(
-                    "[RESOLVE] OK  url_preview={}...",
-                    url[:60],
                 )
-            else:
-                logger.warning(
-                    "[RESOLVE] No direct URL found for '{}'", webpage_url,
+                raise StreamResolveTimeoutError(
+                    f"Stream resolution timed out for: {webpage_url}"
                 )
-            return url
-        except asyncio.TimeoutError:
-            # CRITICAL: Do NOT return None here.
-            # Returning None would cause _build_stream() to fall back to
-            # FFmpegStreamBuilder.build_from_youtube(), which launches a second
-            # yt-dlp + Deno + FFmpeg while the ghost executor thread's yt-dlp
-            # + Deno are still running — confirmed OOM trigger on Render 512 MB.
-            #
-            # Raising StreamResolveTimeoutError instead signals the controller
-            # that fallback is forbidden for this failure mode.
-            #
-            # Phase-1 accepted limitation: the ghost thread continues until
-            # _sync_resolve() completes naturally (up to ~60–120 s in worst
-            # case).  It cannot be killed without subprocess-based resolution
-            # (Phase 2).  Preventing the fallback is sufficient to avoid OOM.
-            logger.error(
-                "[RESOLVE] Timed out for '{}' — "
-                "ghost executor thread may still be running; "
-                "fallback suppressed to prevent OOM",
-                webpage_url,
-            )
-            raise StreamResolveTimeoutError(
-                f"Stream resolution timed out for: {webpage_url}"
-            )
 
     @staticmethod
     def shutdown() -> None:
-        """Drain the executor on application shutdown."""
-        _RESOLVE_EXECUTOR.shutdown(wait=False)
-        logger.debug("StreamResolver executor shut down")
-
-    # ── Private sync (runs in executor) ───────────────────────────────────────
-
-    def _sync_resolve(self, webpage_url: str) -> Optional[str]:
         """
-        Full yt-dlp extraction using mweb as the primary client.
+        No-op: subprocess-based resolver has no persistent executor.
 
-        mweb (YouTube Mobile Web) triggers yt-dlp's automatic PO-token
-        generation via Deno + yt-dlp-ejs, which is the correct bypass for
-        Render's data-centre IP range.  web is the secondary client using
-        the same PO-token path.  tv_embedded is a last-resort fallback.
-
-        URL selection priority:
-          1. Best audio-only format (vcodec == none) sorted by bitrate
-          2. Best muxed format that has audio (tv_embedded returns these)
-          3. info["url"] when yt-dlp returns a single-format response
+        Called by the bootstrap shutdown path for compatibility.
         """
-        opts = dict(_STREAM_OPTS)
+        logger.debug(
+            "[RESOLVE] StreamResolver.shutdown() called "
+            "(subprocess mode — nothing to drain)"
+        )
+
+    # ── Private async subprocess ───────────────────────────────────────────────
+
+    async def _resolve_subprocess(self, webpage_url: str) -> Optional[str]:
+        """
+        Spawn yt-dlp as a subprocess and return the direct audio URL.
+
+        start_new_session=True places yt-dlp in its own process group so
+        SIGTERM via os.killpg() kills both yt-dlp and its Deno child.
+
+        On CancelledError (asyncio.wait_for timeout):
+          1. _kill_proc_group() sends SIGTERM to the process group.
+          2. CancelledError is re-raised.
+          3. asyncio.wait_for() converts it to TimeoutError.
+          4. resolve() converts TimeoutError to StreamResolveTimeoutError.
+
+        Result: no orphaned yt-dlp or Deno processes, no ghost memory.
+        """
+        cmd: list[str] = [
+            "yt-dlp",
+            "--format",          _YDL_FORMAT,
+            "--no-playlist",
+            "--geo-bypass",
+            "--socket-timeout",  "10",
+            "--retries",         "1",
+            "--extractor-args",  f"youtube:player_client={_PLAYER_CLIENTS}",
+            "--quiet",
+            "--no-warnings",
+            "--print",           "url",
+        ]
         if self._cookies_path:
-            opts["cookiefile"] = self._cookies_path
+            cmd += ["--cookies", self._cookies_path]
+        cmd.append(webpage_url)
 
+        logger.debug("[RESOLVE] Spawning yt-dlp  url='{}'", webpage_url)
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,   # new pgid — safe group kill on timeout
+        )
+
+        stdout = b""
+        stderr = b""
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(webpage_url, download=False)
+            stdout, stderr = await proc.communicate()
+        except BaseException:
+            # CancelledError (timeout) or any other exception while waiting.
+            # Kill yt-dlp + Deno before propagating so no processes are orphaned.
+            _kill_proc_group(proc)
+            raise
 
-            if not info:
-                return None
-
-            formats: List[Dict] = info.get("formats") or []
-
-            # Priority 1: audio-only streams
-            audio_only = [
-                f for f in formats
-                if f.get("url")
-                and f.get("acodec") not in (None, "none")
-                and f.get("vcodec") in (None, "none")
-            ]
-            if audio_only:
-                best = sorted(
-                    audio_only,
-                    key=lambda f: float(f.get("tbr") or f.get("abr") or 0),
-                    reverse=True,
-                )
-                logger.debug(
-                    "[RESOLVE] Selected audio-only  acodec={}  abr={}kbps",
-                    best[0].get("acodec"),
-                    best[0].get("abr") or best[0].get("tbr"),
-                )
-                return best[0]["url"]
-
-            # Priority 2: muxed streams with audio
-            with_audio = [
-                f for f in formats
-                if f.get("url")
-                and f.get("acodec") not in (None, "none")
-            ]
-            if with_audio:
-                best_mux = sorted(
-                    with_audio,
-                    key=lambda f: float(f.get("tbr") or 0),
-                    reverse=True,
-                )
-                logger.debug(
-                    "[RESOLVE] Selected muxed  ext={}  tbr={}kbps",
-                    best_mux[0].get("ext"),
-                    best_mux[0].get("tbr"),
-                )
-                return best_mux[0]["url"]
-
-            # Priority 3: single-format response
-            return info.get("url")
-
-        except yt_dlp.utils.DownloadError as exc:
-            logger.error("[RESOLVE] DownloadError for '{}': {}", webpage_url, exc)
+        if proc.returncode != 0:
+            err = stderr.decode(errors="replace").strip()
+            logger.error(
+                "[RESOLVE] yt-dlp exited {}  url='{}'\nstderr: {}",
+                proc.returncode, webpage_url, err[:500],
+            )
             return None
-        except Exception as exc:
-            logger.error("[RESOLVE] Unexpected error for '{}': {}", webpage_url, exc)
+
+        # --print url outputs one URL per line; take the first http(s) line.
+        lines = [
+            ln.strip()
+            for ln in stdout.decode(errors="replace").splitlines()
+            if ln.strip().startswith("http")
+        ]
+        if not lines:
+            logger.warning(
+                "[RESOLVE] yt-dlp returned no URL  url='{}'  raw={!r}",
+                webpage_url, stdout[:120],
+            )
             return None
+
+        return lines[0]
 
 
 # ── Private helpers ────────────────────────────────────────────────────────────
+
+def _kill_proc_group(proc: asyncio.subprocess.Process) -> None:
+    """
+    Send SIGTERM to the yt-dlp process group.
+
+    Because start_new_session=True was used, the process is its own group
+    leader (proc.pid == pgid).  SIGTERM propagates to Deno, which yt-dlp
+    spawned as a child.  Falls back to proc.kill() (SIGKILL on the main
+    process only) if killpg fails.
+    """
+    if proc.returncode is not None:
+        return  # already exited — nothing to kill
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        logger.debug("[RESOLVE] SIGTERM sent to process group pid={}", proc.pid)
+    except (ProcessLookupError, PermissionError, OSError) as kill_err:
+        logger.debug(
+            "[RESOLVE] killpg failed ({}) — falling back to proc.kill()", kill_err
+        )
+        try:
+            proc.kill()
+        except (ProcessLookupError, PermissionError):
+            pass
+
 
 def _resolve_cookies_tmp(cookies_path: Optional[str]) -> Optional[str]:
     """Return the /tmp copy of cookies_path if it exists, else None."""
