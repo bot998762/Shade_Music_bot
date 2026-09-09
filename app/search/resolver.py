@@ -21,35 +21,55 @@ CancelledError at the ``await proc.communicate()`` line.  Our except-clause
 then calls _kill_proc_group() which sends SIGTERM to the yt-dlp process group
 (yt-dlp + its Deno child).  No ghost processes, no leaked memory.
 
-Format selection fix
---------------------
-The previous implementation omitted the format selector and relied on manual
-parsing of info["formats"].  yt-dlp's internal default selector
-(bestvideo*+bestaudio/best) raised "Requested format is not available" when
-the mweb/web/tv_embedded player clients return audio-only or restricted-format
-lists (confirmed in production logs).
+Why the resolver was timing out (Phase-2 production failure)
+-------------------------------------------------------------
+Phase-2 deployed with ``_PLAYER_CLIENTS = "mweb,web,tv_embedded"``.
 
-``--format "bestaudio[acodec!=none]/best[acodec!=none]/best"`` tells yt-dlp to
-select the best audio-only stream with an actual codec (DASH audio), falling
-back to the best muxed format with audio, then any best format.  Combined with
-``--print url``, yt-dlp outputs just the direct CDN URL — no JSON parsing.
+yt-dlp auto-detects Deno at /usr/local/bin/deno (installed in our
+Dockerfile) and uses it to generate YouTube Proof-of-Origin (PO) tokens for
+the mweb and web player clients.  This is required to obtain usable CDN URLs
+from those clients since YouTube began enforcing PO tokens in late 2024.
+
+On Render free tier:
+  - Each deploy starts a fresh container — the Deno module cache
+    (~/.cache/deno) is empty on every cold start.
+  - Deno JIT-compiles yt-dlp-ejs on first invocation.
+  - On a throttled 512 MB free-plan instance, this JIT compilation
+    takes > 30 s — longer than STREAM_RESOLVE_TIMEOUT_SEC.
+  - yt-dlp is stuck waiting for Deno to return a PO token.
+  - Our timeout fires → SIGTERM → resolver raises StreamResolveTimeoutError.
+
+This explains why:
+  a) Search works  — uses extract_flat which never fetches stream URLs or
+                     PO tokens.  Deno is never invoked.
+  b) Resolver times out consistently — full URL extraction triggers PO
+                     token generation, Deno hangs, 30 s timeout fires.
+  c) The timeout started appearing AFTER Phase 2, not before —
+                     Phase 2's format selector successfully reaches the PO
+                     token step, whereas Phase 1's missing selector caused
+                     yt-dlp to fail earlier with "format not available".
+
+The fix: tv_embedded client (no Deno, no PO tokens)
+----------------------------------------------------
+YouTube's TVHTML5_SIMPLY_EMBEDDED_PLAYER API (client name: tv_embedded)
+returns stream URLs that do NOT require PO-token validation.  yt-dlp
+recognises this and does not invoke Deno for tv_embedded responses.
+
+Result: full URL extraction completes in 2–5 s instead of > 30 s.
+
+Format coverage with tv_embedded:
+  - Format 140  (m4a audio-only, 128 kbps)   — preferred by bestaudio
+  - Format 251  (opus audio-only, 160 kbps)  — preferred by bestaudio
+  - Format 18   (360p mp4 muxed)             — best fallback
+  - Format 22   (720p mp4 muxed)             — occasional fallback
+  All are usable by FFmpeg → PyTgCalls for audio playback.
 
 Concurrency limit
 -----------------
-Each yt-dlp + Deno subprocess uses ~100–200 MB peak.  The bot base is ~150 MB.
-Two concurrent subprocesses would exceed Render's 512 MB limit.  A module-level
-asyncio.Semaphore(1) serialises concurrent resolve() calls — the second chat
-waits rather than causing OOM.
-
-Player client strategy
-----------------------
-mweb (YouTube Mobile Web) is primary.  yt-dlp automatically generates PO
-tokens for mweb via Deno + yt-dlp-ejs when Deno is on PATH (installed in our
-Dockerfile).  web is secondary (same PO-token path).  tv_embedded is a last-
-resort fallback for edge cases.
-
-iOS and Android are excluded: yt-dlp cannot auto-generate PO tokens for native
-app clients from server IPs.
+Each yt-dlp subprocess uses ~80–150 MB peak (no Deno now, so lower than
+before).  The bot base is ~150 MB.  The asyncio.Semaphore(1) gate is kept
+as a memory safety rail for 512 MB Render, even though the memory pressure
+is now lower.
 
 Contract
 --------
@@ -76,23 +96,39 @@ from app.shared.constants import (
 from app.shared.exceptions import StreamResolveTimeoutError
 
 # ── Format selector ────────────────────────────────────────────────────────────
-# Priority 1: best audio-only stream with an actual codec (DASH opus/m4a)
+# Priority 1: best audio-only stream with an actual codec (DASH m4a/opus)
 # Priority 2: best overall format that carries audio (muxed mp4/webm)
 # Priority 3: absolute best — last resort when nothing else matches
 #
-# This replaces the old "no format selector" approach that triggered yt-dlp's
-# default bestvideo*+bestaudio/best selector, which raised
-# "Requested format is not available" with mweb/web/tv_embedded clients.
+# This explicit selector replaced the old "no format selector" approach which
+# triggered yt-dlp's default bestvideo*+bestaudio/best and raised
+# "Requested format is not available" with mweb/web player clients.
 _YDL_FORMAT = "bestaudio[acodec!=none]/best[acodec!=none]/best"
 
-# ── Player clients ─────────────────────────────────────────────────────────────
-_PLAYER_CLIENTS = "mweb,web,tv_embedded"
+# ── Player client ──────────────────────────────────────────────────────────────
+# tv_embedded = TVHTML5_SIMPLY_EMBEDDED_PLAYER
+#
+# This is the sole player client.  See module docstring for the full
+# explanation.  Short version:
+#
+#   mweb / web   → require YouTube PO tokens → yt-dlp invokes Deno →
+#                  Deno JIT compilation hangs > 30 s on Render free tier →
+#                  StreamResolveTimeoutError every time.
+#
+#   tv_embedded  → does NOT require PO tokens → Deno never invoked →
+#                  resolves in 2–5 s.
+#
+# DO NOT restore mweb or web here without first confirming that Deno cold-
+# start completes well within STREAM_RESOLVE_TIMEOUT_SEC on the target
+# Render plan.  Pre-warming the Deno cache in the Dockerfile would be
+# necessary for that.
+_PLAYER_CLIENT = "tv_embedded"
 
 # ── Concurrency gate ───────────────────────────────────────────────────────────
-# Limits simultaneous yt-dlp subprocesses to 1.
-# Each subprocess (yt-dlp + Deno) peaks at ~100–200 MB.
-# With the bot base at ~150 MB, two concurrent subprocesses exceed 512 MB.
-# Callers wait inside resolve(); the second chat is not dropped, only delayed.
+# Caps simultaneous yt-dlp subprocesses at 1.
+# Peak memory per subprocess: ~80–150 MB (no Deno invocation now).
+# Bot base: ~150 MB.  Two concurrent subprocesses would still risk OOM on
+# a 512 MB instance if other work is also happening.  Keep the gate.
 _RESOLVE_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(1)
 
 
@@ -187,8 +223,12 @@ class StreamResolver:
         """
         Spawn yt-dlp as a subprocess and return the direct audio URL.
 
+        Uses tv_embedded client — no PO tokens, no Deno, fast completion.
+
         start_new_session=True places yt-dlp in its own process group so
-        SIGTERM via os.killpg() kills both yt-dlp and its Deno child.
+        SIGTERM via os.killpg() kills both yt-dlp and any child processes
+        it may have spawned (e.g. a future Deno invocation for a different
+        client, or FFmpeg for format probing).
 
         On CancelledError (asyncio.wait_for timeout):
           1. _kill_proc_group() sends SIGTERM to the process group.
@@ -196,25 +236,28 @@ class StreamResolver:
           3. asyncio.wait_for() converts it to TimeoutError.
           4. resolve() converts TimeoutError to StreamResolveTimeoutError.
 
-        Result: no orphaned yt-dlp or Deno processes, no ghost memory.
+        Result: no orphaned processes, no ghost memory.
         """
         cmd: list[str] = [
             "yt-dlp",
-            "--format",          _YDL_FORMAT,
+            "--format",         _YDL_FORMAT,
             "--no-playlist",
             "--geo-bypass",
-            "--socket-timeout",  "10",
-            "--retries",         "1",
-            "--extractor-args",  f"youtube:player_client={_PLAYER_CLIENTS}",
+            "--socket-timeout", "10",
+            "--retries",        "1",
+            "--extractor-args", f"youtube:player_client={_PLAYER_CLIENT}",
             "--quiet",
             "--no-warnings",
-            "--print",           "url",
+            "--print",          "url",
         ]
         if self._cookies_path:
             cmd += ["--cookies", self._cookies_path]
         cmd.append(webpage_url)
 
-        logger.debug("[RESOLVE] Spawning yt-dlp  url='{}'", webpage_url)
+        logger.debug(
+            "[RESOLVE] Spawning yt-dlp  client={}  url='{}'",
+            _PLAYER_CLIENT, webpage_url,
+        )
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -229,15 +272,16 @@ class StreamResolver:
             stdout, stderr = await proc.communicate()
         except BaseException:
             # CancelledError (timeout) or any other exception while waiting.
-            # Kill yt-dlp + Deno before propagating so no processes are orphaned.
+            # Kill yt-dlp (and any child it spawned) before propagating so no
+            # processes are orphaned.
             _kill_proc_group(proc)
             raise
 
         if proc.returncode != 0:
             err = stderr.decode(errors="replace").strip()
             logger.error(
-                "[RESOLVE] yt-dlp exited {}  url='{}'\nstderr: {}",
-                proc.returncode, webpage_url, err[:500],
+                "[RESOLVE] yt-dlp exited {}  url='{}'  client={}\nstderr: {}",
+                proc.returncode, webpage_url, _PLAYER_CLIENT, err[:500],
             )
             return None
 
@@ -249,8 +293,8 @@ class StreamResolver:
         ]
         if not lines:
             logger.warning(
-                "[RESOLVE] yt-dlp returned no URL  url='{}'  raw={!r}",
-                webpage_url, stdout[:120],
+                "[RESOLVE] yt-dlp returned no URL  url='{}'  client={}  raw={!r}",
+                webpage_url, _PLAYER_CLIENT, stdout[:120],
             )
             return None
 
@@ -264,8 +308,8 @@ def _kill_proc_group(proc: asyncio.subprocess.Process) -> None:
     Send SIGTERM to the yt-dlp process group.
 
     Because start_new_session=True was used, the process is its own group
-    leader (proc.pid == pgid).  SIGTERM propagates to Deno, which yt-dlp
-    spawned as a child.  Falls back to proc.kill() (SIGKILL on the main
+    leader (proc.pid == pgid).  SIGTERM propagates to any children yt-dlp
+    may have spawned.  Falls back to proc.kill() (SIGKILL on the main
     process only) if killpg fails.
     """
     if proc.returncode is not None:
