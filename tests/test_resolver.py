@@ -2,6 +2,19 @@
 tests.test_resolver
 ~~~~~~~~~~~~~~~~~~~
 Unit tests for app.search.resolver — the subprocess-based stream resolver.
+
+Tests verify:
+  - Successful yt-dlp exit → returns URL string
+  - Non-zero yt-dlp exit → returns None (no exception)
+  - Timeout → kills subprocess process group + raises StreamResolveTimeoutError
+  - CancelledError → kills subprocess + re-raises
+  - Empty/non-http stdout → returns None
+  - Only tv_embedded player client in command (not mweb/web — Deno hang fix)
+  - Cookies path plumbing
+  - Concurrency gate (semaphore limits to 1 simultaneous call)
+  - shutdown() is a no-op
+
+All yt-dlp subprocess calls are mocked — no network access.
 """
 
 from __future__ import annotations
@@ -15,7 +28,6 @@ from typing import Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 # ── Stub missing prod deps for the test sandbox ───────────────────────────────
-# (loguru is not pip-installable in this environment; all others are indirect)
 for _mod_name in ["loguru"]:
     if _mod_name not in sys.modules:
         _m = types.ModuleType(_mod_name)
@@ -61,6 +73,91 @@ class TestStreamResolverSubprocess(unittest.IsolatedAsyncioTestCase):
         self.resolver_mod = resolver_mod
         self.Resolver = resolver_mod.StreamResolver
 
+    # ── Critical: player client selection (Deno-hang fix) ────────────────────
+
+    async def test_command_uses_tv_embedded_not_mweb_or_web(self) -> None:
+        """
+        The subprocess command MUST use tv_embedded and NOT mweb or web.
+
+        mweb/web trigger Deno PO token generation.  On Render free tier,
+        Deno JIT compilation on cold start takes > 30 s, causing consistent
+        StreamResolveTimeoutError.  tv_embedded returns stream URLs without
+        PO tokens — Deno is never invoked.
+        """
+        captured_cmd: list[str] = []
+
+        async def _capture(*args, **kwargs):
+            captured_cmd.extend(args)
+            return _fake_process(
+                returncode=0,
+                stdout=b"https://rr1.googlevideo.com/audio\n",
+            )
+
+        with patch("asyncio.create_subprocess_exec", side_effect=_capture):
+            resolver = self.Resolver()
+            await resolver._resolve_subprocess("https://www.youtube.com/watch?v=test")
+
+        cmd_str = " ".join(str(x) for x in captured_cmd)
+
+        # tv_embedded must be present
+        self.assertIn("tv_embedded", cmd_str,
+                      "tv_embedded must be in the yt-dlp command")
+
+        # mweb and web must be absent — they invoke Deno and hang on Render
+        self.assertNotIn("mweb", cmd_str,
+                         "mweb must NOT appear — it invokes Deno and hangs on Render")
+        # Note: "web" is a substring of "tv_embedded", so check the extractor-args value
+        extractor_arg_idx = captured_cmd.index("--extractor-args") + 1 \
+            if "--extractor-args" in captured_cmd else -1
+        if extractor_arg_idx > 0:
+            extractor_val = captured_cmd[extractor_arg_idx]
+            # Should be exactly "youtube:player_client=tv_embedded"
+            # Must not contain bare "web" or "mweb" as clients
+            self.assertNotIn("mweb", extractor_val)
+            clients_part = extractor_val.split("player_client=")[-1] if "player_client=" in extractor_val else ""
+            client_list = [c.strip() for c in clients_part.split(",")]
+            for c in client_list:
+                self.assertNotEqual(c, "web",
+                    "web client must NOT be used — it invokes Deno and hangs on Render")
+                self.assertNotEqual(c, "mweb",
+                    "mweb client must NOT be used — it invokes Deno and hangs on Render")
+
+    async def test_command_has_correct_format_selector(self) -> None:
+        """Format selector must be the explicit bestaudio/best chain."""
+        captured_cmd: list[str] = []
+
+        async def _capture(*args, **kwargs):
+            captured_cmd.extend(args)
+            return _fake_process(returncode=0, stdout=b"https://cdn.example.com/\n")
+
+        with patch("asyncio.create_subprocess_exec", side_effect=_capture):
+            resolver = self.Resolver()
+            await resolver._resolve_subprocess("https://www.youtube.com/watch?v=test")
+
+        self.assertIn("--format", captured_cmd)
+        fmt_idx = captured_cmd.index("--format") + 1
+        fmt = captured_cmd[fmt_idx]
+        self.assertIn("bestaudio", fmt)
+        self.assertIn("best", fmt)
+
+    async def test_command_uses_print_url(self) -> None:
+        """--print url must be in the command for clean URL-only stdout."""
+        captured_cmd: list[str] = []
+
+        async def _capture(*args, **kwargs):
+            captured_cmd.extend(args)
+            return _fake_process(returncode=0, stdout=b"https://cdn.example.com/\n")
+
+        with patch("asyncio.create_subprocess_exec", side_effect=_capture):
+            resolver = self.Resolver()
+            await resolver._resolve_subprocess("https://www.youtube.com/watch?v=test")
+
+        self.assertIn("--print", captured_cmd)
+        print_idx = captured_cmd.index("--print") + 1
+        self.assertEqual(captured_cmd[print_idx], "url")
+
+    # ── Core subprocess behaviour ─────────────────────────────────────────────
+
     async def test_success_returns_http_url(self) -> None:
         proc = _fake_process(
             returncode=0,
@@ -76,7 +173,7 @@ class TestStreamResolverSubprocess(unittest.IsolatedAsyncioTestCase):
         proc = _fake_process(
             returncode=1,
             stdout=b"",
-            stderr=b"ERROR: [Youtube] test: Requested format is not available.",
+            stderr=b"ERROR: [Youtube] test: Video unavailable",
         )
         with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
             resolver = self.Resolver()
@@ -110,7 +207,6 @@ class TestStreamResolverSubprocess(unittest.IsolatedAsyncioTestCase):
     async def test_cancelled_error_kills_process_group(self) -> None:
         """CancelledError during communicate() triggers _kill_proc_group()."""
         proc = _fake_process(raise_on_communicate=asyncio.CancelledError())
-
         killed = []
 
         def _fake_killpg(pgid, sig):
@@ -123,7 +219,10 @@ class TestStreamResolverSubprocess(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await resolver._resolve_subprocess("https://www.youtube.com/watch?v=test")
 
-        self.assertTrue(len(killed) > 0, "killpg should have been called on CancelledError")
+        self.assertTrue(len(killed) > 0,
+                        "killpg should have been called on CancelledError")
+
+    # ── Public resolve() API ──────────────────────────────────────────────────
 
     async def test_resolve_timeout_raises_StreamResolveTimeoutError(self) -> None:
         async def _slow_communicate():
@@ -185,8 +284,10 @@ class TestStreamResolverSubprocess(unittest.IsolatedAsyncioTestCase):
     async def test_shutdown_is_noop(self) -> None:
         self.Resolver.shutdown()  # must not raise
 
+    # ── Concurrency gate ──────────────────────────────────────────────────────
+
     async def test_semaphore_serialises_concurrent_calls(self) -> None:
-        """Two concurrent resolve() calls must run sequentially (semaphore=1)."""
+        """Two concurrent resolve() calls run sequentially (semaphore value=1)."""
         call_order = []
         call_count = [0]
 
@@ -217,12 +318,13 @@ class TestStreamResolverSubprocess(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(len(results), 2)
-        # Semaphore ensures: start_0 → end_0 → start_1 → end_1
+        # Semaphore must force sequential execution: start_0 → end_0 → start_1 → end_1
         self.assertEqual(call_order, ["start_0", "end_0", "start_1", "end_1"],
-                         f"Expected sequential execution but got: {call_order}")
+                         f"Expected sequential (semaphore=1) but got: {call_order}")
 
 
 class TestExceptionHierarchy(unittest.TestCase):
+    """Verify exception subclass relationships used in handler catch order."""
 
     def test_timeout_is_subclass_of_resolve_error(self) -> None:
         self.assertTrue(issubclass(StreamResolveTimeoutError, StreamResolveError))

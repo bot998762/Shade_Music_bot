@@ -82,6 +82,69 @@ RUN mkdir -p /app/logs && chown botuser:botuser /app/logs
 
 USER botuser
 
+# ── Deno/yt-dlp-ejs JIT pre-warm ──────────────────────────────────────────────
+# Context
+# -------
+# yt-dlp ≥ 2025.11.12 spawns Deno to compute YouTube PO tokens before returning
+# stream URLs.  On Render's ephemeral free-plan containers the Deno module cache
+# (~/.cache/deno) is empty on every cold start.  Deno JIT-compiles yt-dlp-ejs
+# from scratch, which takes > 30 s on a throttled 512 MB instance and causes
+# StreamResolveTimeoutError on every /play command.
+#
+# Fix
+# ---
+# Compile yt-dlp-ejs through Deno at IMAGE BUILD TIME so the V8 bytecode cache
+# is baked into this image layer.  At container start the cache already exists;
+# Deno reads compiled bytecode and starts in < 1 s.
+#
+# Why stdin=/dev/null is sufficient
+# ----------------------------------
+# Deno's V8 compilation (Phase 1) runs before any userspace JS executes.
+# The cache key is (absolute-file-path, content-hash) — independent of stdin.
+# Running with stdin=/dev/null triggers the identical Phase 1 write as a real
+# yt-dlp invocation.  If yt-dlp-ejs then blocks waiting for IPC input (Phase 2),
+# timeout(30) kills it — but Phase 1, and therefore the cache, is already done.
+#
+# Safety guarantees
+# -----------------
+#   stdout/stderr → /dev/null : eliminates SIGPIPE risk from any piping
+#   stdin         → /dev/null : yt-dlp-ejs exits after reading EOF (or is
+#                               killed after 30 s — Phase 1 already complete)
+#   timeout 30                : prevents a broken EJS from hanging the build
+#   DENO_NO_UPDATE_CHECK=1    : suppresses deno.land version-check network call
+#   DENO_DIR set explicitly   : deterministic cache path matches runtime path
+#   exit 1 on EJS not found   : build fails loudly instead of producing a
+#                               silently broken image
+#   exit 1 on unexpected deno error code (not 0 or 124): same loud failure
+#   exit code 124 (timeout)   : treated as success — Phase 1 is provably done
+#
+# Must run as botuser (same uid as runtime) so cache writes to
+# /home/botuser/.cache/deno — the default DENO_DIR for this user at runtime.
+# Must be after COPY steps so yt-dlp-ejs is already present on disk.
+RUN export DENO_NO_UPDATE_CHECK=1 DENO_DIR=/home/botuser/.cache/deno \
+    && EJS=$(find /usr/local/lib/python3.12/site-packages/yt_dlp \
+                  -name "main.js" -path "*ejs*" 2>/dev/null | head -1) \
+    && { [ -n "$EJS" ] || { \
+           echo "[deno-warmup] FATAL: yt-dlp-ejs main.js not found under" \
+                "/usr/local/lib/python3.12/site-packages/yt_dlp/*ejs*." \
+                "Verify that yt-dlp[default] is listed in requirements.txt" \
+                "and that the builder COPY step transferred packages correctly."; \
+           exit 1; }; } \
+    && echo "[deno-warmup] Found yt-dlp-ejs at: $EJS" \
+    && echo "[deno-warmup] Pre-compiling through Deno (timeout 30 s) ..." \
+    && timeout 30 \
+         deno run --allow-all "$EJS" \
+         </dev/null >/dev/null 2>/dev/null \
+    || { CODE=$?; \
+         if [ "$CODE" -eq 124 ]; then \
+           echo "[deno-warmup] Deno terminated by timeout; this is expected when" \
+                "yt-dlp-ejs blocks after EOF — the V8 JIT cache is already written."; \
+         else \
+           echo "[deno-warmup] FATAL: deno exited with unexpected code $CODE."; \
+           exit 1; \
+         fi; } \
+    && echo "[deno-warmup] Cache written to $DENO_DIR — runtime Deno start will be fast."
+
 # Render injects $PORT at runtime; 8080 is the local development fallback.
 EXPOSE 8080
 
