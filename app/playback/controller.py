@@ -35,8 +35,8 @@ swapped without touching this file.
 1. [VALIDATE]  Input already validated by handler and validators.
 2. [SEARCH]    YouTubeSearch.search(query) → SearchResult
 3. [TRACK]     Track.from_search_result() — attaches request context
-4. [ENQUEUE]   SessionManager.enqueue()
-5. [IDLE?]     If chat was idle → start playback now
+4. [ENQUEUE]   SessionManager.enqueue_if_room() — atomic cap check + append
+5. [IDLE?]     If chat was idle → start playback now (outside the play lock)
                Else → return "added to queue" result to handler
 6. [RESOLVE]   StreamResolver.resolve() → direct CDN URL
 7. [FFMPEG]    FFmpegStreamBuilder.build_from_url() → MediaStream
@@ -44,16 +44,46 @@ swapped without touching this file.
 9. [STATE]     StateManager.transition_to_playing()
 10.[RETURN]    Return (track, is_playing_now) to handler
 
+Locking contract
+----------------
+_play_lock (per-chat)
+    Guards the idle-check + enqueue decision.
+    Held ONLY for the duration of:
+        session.enqueue_if_room()  — fast, in-memory
+        state.is_idle()            — fast, in-memory dict lookup
+    RELEASED before any I/O: stream resolution, VC join, Telegram API.
+    This ensures a second concurrent /play in the same chat can proceed
+    immediately once the first track has been enqueued and the decision
+    "idle → start now" has been made, without waiting for yt-dlp or
+    the VC join to complete.
+
+_advance_lock (per-chat)
+    Guards advance() to prevent double-advancement when two stream-end
+    events fire for the same chat (e.g. CLOSED_VOICE_CHAT + StreamAudioEnded
+    arriving in close succession).
+    Held for the duration of the full advance() loop, which includes
+    stream resolution.  This is intentional: a second advance() call
+    in the same chat must wait until the first has resolved the next track
+    and called replace_stream(), so that only one track is ever playing.
+
 advance() workflow  (called by StreamMonitor on stream-end)
 -----------------------------------------------------------
-1. [ADVANCE]   Acquire per-chat lock (prevents double-advance)
+1. [ADVANCE]   Acquire per-chat advance lock (prevents double-advance)
 2. [ADVANCE]   Queue empty? → cleanup → IDLE
 3. [ADVANCE]   Dequeue next track
 4. [RESOLVE]   Resolve stream URL
 5. [FFMPEG]    Build MediaStream
 6. [ADVANCE]   voice.replace_stream() → update state → notify
-7. [ADVANCE]   Retry up to MAX_SKIP_RETRIES on replace_stream failure
-8. [ADVANCE]   Retries exhausted? → cleanup → IDLE
+7. [ADVANCE]   Track resolve/replace failure → skip this track, retry next
+8. [ADVANCE]   MAX_SKIP_RETRIES consecutive failures → cleanup → IDLE
+
+Retry semantics
+---------------
+MAX_SKIP_RETRIES limits the number of consecutive track failures (resolve
+error, replace_stream failure) before giving up the entire session.
+Each successful advance resets the counter to 0.  This prevents one bad
+track from destroying a healthy queue while still protecting against a
+queue full of unplayable tracks.
 
 _build_stream() failure modes
 ------------------------------
@@ -158,8 +188,9 @@ class PlaybackController:
         # One advance lock per chat — prevents concurrent StreamAudioEnded events
         # from double-advancing the queue.
         self._advance_locks: Dict[int, asyncio.Lock] = {}
-        # One play lock per chat — prevents concurrent /play commands in the
-        # same idle chat from each calling _start_now() simultaneously.
+        # One play lock per chat — guards the idle-check + enqueue decision.
+        # IMPORTANT: this lock is released BEFORE slow I/O (stream resolution,
+        # VC join).  It protects only the brief in-memory decision window.
         self._play_locks: Dict[int, asyncio.Lock] = {}
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -196,9 +227,6 @@ class PlaybackController:
             When the VC join fails.
         """
         # ── Stage: SEARCH or DIRECT-URL FETCH ────────────────────────
-        # For a direct URL: skip the ytsearch1: round-trip and fetch metadata
-        # directly.  The CDN stream URL is resolved by _build_stream() at play
-        # time — same path as for search results.
         if is_direct_url(query):
             logger.info(
                 "[CONTROLLER] [FETCH_URL] Direct URL  url='{}'  chat_id={}",
@@ -224,37 +252,70 @@ class PlaybackController:
             track.title, track.webpage_url,
         )
 
-        # ── Stage: ENQUEUE + START (per-chat lock) ────────────────────────
+        # ── Stage: ENQUEUE + IDLE-CHECK (brief lock) ──────────────────────
+        # The play lock guards only the in-memory decision:
+        #   1. Atomic cap check + enqueue  (enqueue_if_room)
+        #   2. Read is_idle to decide whether to start playback now
+        # The lock is released BEFORE any I/O so that a second concurrent
+        # /play in the same chat can proceed without waiting for yt-dlp or
+        # the VC join of the first track.
         if chat_id not in self._play_locks:
             self._play_locks[chat_id] = asyncio.Lock()
 
         async with self._play_locks[chat_id]:
-            queue_size = await self._session.size(chat_id)
-            if queue_size >= self._max_q:
+            added, pos_or_size = await self._session.enqueue_if_room(
+                chat_id, track, self._max_q
+            )
+            if not added:
                 raise QueueFullError(
                     f"Queue is full ({self._max_q} tracks). "
                     "Wait for the current track to finish."
                 )
 
             was_idle = self._state.is_idle(chat_id)
-            position = await self._session.enqueue(chat_id, track)
             logger.info(
                 "[CONTROLLER] [ENQUEUE] title='{}'  chat_id={}  "
                 "position={}  was_idle={}",
-                track.title, chat_id, position, was_idle,
+                track.title, chat_id, pos_or_size, was_idle,
             )
-
             if was_idle:
+                # Optimistically mark state as PLAYING before releasing the
+                # play lock.  This prevents a concurrent /play call from also
+                # seeing is_idle=True and racing into _start_now().
+                #
+                # We use update_current_track(None) + a direct status write
+                # via transition_to_playing with a placeholder — but the
+                # cleanest path is a dedicated "mark_starting" transition.
+                # Since PlaybackStatus has no STARTING state yet, we
+                # temporarily set the track to avoid breaking state.get().
+                # If _start_now() fails, cleanup() calls transition_to_idle()
+                # which correctly reverts the state.
+                self._state.transition_to_playing(chat_id, track)
+                # Lock is released here; _start_now() runs outside the lock.
+
+        if was_idle:
+            try:
                 await self._start_now(chat_id)
-                return track, True
-            else:
-                return track, False
+            except Exception:
+                # _start_now already called cleanup() which transitions back
+                # to IDLE — re-raise so the handler can show the error.
+                raise
+            return track, True
+        else:
+            return track, False
 
     async def advance(self, chat_id: int) -> None:
         """
         Auto-advance to the next queued track after the current one ends.
 
         Called exclusively by StreamMonitor when a stream-end event fires.
+
+        Retry semantics
+        ---------------
+        ``retries`` counts consecutive failures on the current attempt.
+        A successful advance resets it to 0.  This allows a queue of
+        [bad, bad, good, bad, good] to play [good, good] instead of
+        aborting after 3 total failures across the entire queue.
 
         Stage log: [CONTROLLER] [ADVANCE]
         """
@@ -263,9 +324,9 @@ class PlaybackController:
 
         async with self._advance_locks[chat_id]:
             logger.info("[CONTROLLER] [ADVANCE] Advancing  chat_id={}", chat_id)
-            retries = 0
+            consecutive_failures = 0
 
-            while retries < MAX_SKIP_RETRIES:
+            while consecutive_failures < MAX_SKIP_RETRIES:
                 # ── Queue empty: all tracks played ─────────────────────────
                 if await self._session.is_empty(chat_id):
                     logger.info(
@@ -295,29 +356,27 @@ class PlaybackController:
                 try:
                     stream = await self._build_stream(next_track)
                 except StreamResolveTimeoutError:
-                    # Timeout: yt-dlp subprocess was killed; no ghost processes.
-                    # Skip this track and try the next.
                     logger.error(
                         "[CONTROLLER] [ADVANCE] Resolver timeout for '{}' — "
-                        "skipping (attempt {}/{})  chat_id={}",
-                        next_track.title, retries + 1, MAX_SKIP_RETRIES, chat_id,
+                        "skipping (consecutive_failures={})  chat_id={}",
+                        next_track.title, consecutive_failures + 1, chat_id,
                     )
-                    retries += 1
+                    consecutive_failures += 1
                     continue
                 except StreamResolveError:
-                    # Genuine extraction failure — track is unplayable.
-                    # Skip to the next track.
                     logger.error(
                         "[CONTROLLER] [ADVANCE] Stream unavailable for '{}' — "
-                        "skipping (attempt {}/{})  chat_id={}",
-                        next_track.title, retries + 1, MAX_SKIP_RETRIES, chat_id,
+                        "skipping (consecutive_failures={})  chat_id={}",
+                        next_track.title, consecutive_failures + 1, chat_id,
                     )
-                    retries += 1
+                    consecutive_failures += 1
                     continue
 
                 changed = await self._voice.replace_stream(chat_id, stream)
 
                 if changed:
+                    # ── Success: reset failure counter ─────────────────────
+                    consecutive_failures = 0
                     self._state.update_current_track(chat_id, next_track)
                     logger.info(
                         "[CONTROLLER] [ADVANCE] Playback advanced to '{}'  "
@@ -328,18 +387,18 @@ class PlaybackController:
                     return
 
                 # ── replace_stream failed — retry with next track ──────────
-                retries += 1
+                consecutive_failures += 1
                 logger.warning(
                     "[CONTROLLER] [ADVANCE] replace_stream failed for '{}' "
-                    "(attempt {}/{})  chat_id={}",
-                    next_track.title, retries, MAX_SKIP_RETRIES, chat_id,
+                    "(consecutive_failures={})  chat_id={}",
+                    next_track.title, consecutive_failures, chat_id,
                 )
 
-            # ── Retries exhausted ──────────────────────────────────────────
+            # ── Consecutive failures exhausted ─────────────────────────────
             logger.error(
                 "[CONTROLLER] [ADVANCE] {} consecutive failures — "
                 "triggering cleanup  chat_id={}",
-                MAX_SKIP_RETRIES, chat_id,
+                consecutive_failures, chat_id,
             )
             await self._cleanup.cleanup(
                 chat_id, reason="advance_retries_exhausted"
@@ -355,7 +414,10 @@ class PlaybackController:
         """
         Dequeue the head track, resolve its stream, and join the voice chat.
 
-        Called by play() when the chat was idle — first track in a new session.
+        Called by play() AFTER the play lock has been released — this method
+        performs slow I/O (stream resolution, VC join) and must NOT be called
+        while the play lock is held, or it would block concurrent /play calls
+        in the same chat for the entire duration of yt-dlp + VC join.
 
         On resolver timeout:  runs cleanup() and re-raises StreamResolveTimeoutError.
         On resolver failure:  runs cleanup() and re-raises StreamResolveError.

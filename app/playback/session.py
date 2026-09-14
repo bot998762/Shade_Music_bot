@@ -18,6 +18,20 @@ Design
 * All public methods are coroutines for a stable interface, even though the
   current implementation is synchronous under the lock.
 
+Queue cap enforcement
+---------------------
+The queue cap MUST be checked and the track appended atomically under the
+same lock acquisition.  Checking size() then calling enqueue() as two
+separate lock acquisitions creates a TOCTOU race: two concurrent /play
+calls in the same chat could both observe size=N (below the cap), both
+pass the check, and both enqueue — resulting in size=N+2 and a broken cap
+guarantee.
+
+enqueue_if_room() performs the check and append atomically, returning
+(True, position) on success and (False, current_size) when the cap is
+already reached.  PlaybackController uses this exclusively instead of the
+separate size() + enqueue() pattern.
+
 Phase 1+ extensions (no redesign required)
 ------------------------------------------
   shuffle()   — reorder the deque
@@ -30,7 +44,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from typing import Deque, Dict, List, Optional
+from typing import Deque, Dict, List, Optional, Tuple
 
 from app.search.models import Track
 
@@ -61,11 +75,42 @@ class SessionManager:
 
     # ── Write operations ──────────────────────────────────────────────────────
 
+    async def enqueue_if_room(
+        self, chat_id: int, track: Track, max_size: int
+    ) -> Tuple[bool, int]:
+        """
+        Atomically check the queue cap and append *track* if room exists.
+
+        Both the cap check and the append happen inside a single lock
+        acquisition, preventing the TOCTOU race that arises when
+        size() and enqueue() are called as separate operations.
+
+        Returns
+        -------
+        (True, position)
+            Track was added.  *position* is the 1-based queue length after
+            insertion.
+        (False, current_size)
+            Queue was full; track was NOT added.  *current_size* is the
+            queue length at the moment the check ran.
+        """
+        async with self._lock_for(chat_id):
+            q = self._queue_for(chat_id)
+            current = len(q)
+            if current >= max_size:
+                return False, current
+            q.append(track)
+            return True, len(q)
+
     async def enqueue(self, chat_id: int, track: Track) -> int:
         """
-        Append *track* to the tail of the queue.
+        Append *track* to the tail of the queue without a cap check.
 
         Returns the queue length after insertion (1-based position).
+
+        Prefer enqueue_if_room() when a cap must be enforced atomically.
+        This method is retained for callers (e.g. tests) that manage the
+        cap check externally or do not need one.
         """
         async with self._lock_for(chat_id):
             q = self._queue_for(chat_id)
