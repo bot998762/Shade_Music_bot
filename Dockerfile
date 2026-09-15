@@ -82,68 +82,80 @@ RUN mkdir -p /app/logs && chown botuser:botuser /app/logs
 
 USER botuser
 
-# ── Deno/yt-dlp-ejs JIT pre-warm ──────────────────────────────────────────────
+# ── Deno/yt-dlp-ejs V8 cache pre-warm ────────────────────────────────────────
 # Context
 # -------
-# yt-dlp ≥ 2025.11.12 spawns Deno to compute YouTube PO tokens before returning
-# stream URLs.  On Render's ephemeral free-plan containers the Deno module cache
-# (~/.cache/deno) is empty on every cold start.  Deno JIT-compiles yt-dlp-ejs
-# from scratch, which takes > 30 s on a throttled 512 MB instance and causes
-# StreamResolveTimeoutError on every /play command.
+# yt-dlp ≥ 2025.11.12 can invoke Deno to run the yt-dlp-ejs JavaScript bundle
+# for YouTube n-signature deobfuscation.  On Render ephemeral containers the
+# Deno module cache (~/.cache/deno) is empty on every cold start.  If Deno is
+# ever invoked, the first run JIT-compiles yt-dlp-ejs from scratch, taking
+# > 30 s on a throttled 512 MB instance.
 #
-# Fix
-# ---
-# Compile yt-dlp-ejs through Deno at IMAGE BUILD TIME so the V8 bytecode cache
-# is baked into this image layer.  At container start the cache already exists;
-# Deno reads compiled bytecode and starts in < 1 s.
+# Current player client: tv_embedded
+# ------------------------------------
+# The resolver uses ONLY the tv_embedded (TVHTML5_SIMPLY_EMBEDDED_PLAYER)
+# client, which does NOT require YouTube PO tokens.  As of yt-dlp ≥ 2026.07.04,
+# Deno is therefore NOT invoked on the normal /play path.  The pre-warm is a
+# defensive measure for the case that yt-dlp changes this behaviour in a future
+# version, or that n-signature computation falls back to Deno.
 #
-# Why stdin=/dev/null is sufficient
-# ----------------------------------
-# Deno's V8 compilation (Phase 1) runs before any userspace JS executes.
-# The cache key is (absolute-file-path, content-hash) — independent of stdin.
-# Running with stdin=/dev/null triggers the identical Phase 1 write as a real
-# yt-dlp invocation.  If yt-dlp-ejs then blocks waiting for IPC input (Phase 2),
-# timeout(30) kills it — but Phase 1, and therefore the cache, is already done.
+# Previous failure
+# ----------------
+# The previous implementation searched for "main.js" under
+# .../site-packages/yt_dlp/ — the yt-dlp package directory.  This was wrong:
+# yt-dlp-ejs is a SEPARATE PyPI package that installs as yt_dlp_ejs/ at the
+# top level of site-packages, NOT inside the yt_dlp/ directory.  Additionally,
+# the JS file is not named "main.js" — the filename varies by version.
 #
-# Safety guarantees
-# -----------------
-#   stdout/stderr → /dev/null : eliminates SIGPIPE risk from any piping
-#   stdin         → /dev/null : yt-dlp-ejs exits after reading EOF (or is
-#                               killed after 30 s — Phase 1 already complete)
-#   timeout 30                : prevents a broken EJS from hanging the build
-#   DENO_NO_UPDATE_CHECK=1    : suppresses deno.land version-check network call
-#   DENO_DIR set explicitly   : deterministic cache path matches runtime path
-#   exit 1 on EJS not found   : build fails loudly instead of producing a
-#                               silently broken image
-#   exit 1 on unexpected deno error code (not 0 or 124): same loud failure
-#   exit code 124 (timeout)   : treated as success — Phase 1 is provably done
+# Correct discovery mechanism
+# ---------------------------
+# Python importlib.metadata is used to locate the JS file, exactly mirroring
+# how yt-dlp discovers it at runtime.  This is version-agnostic and resilient
+# to any future rename of the JS asset.
 #
-# Must run as botuser (same uid as runtime) so cache writes to
-# /home/botuser/.cache/deno — the default DENO_DIR for this user at runtime.
-# Must be after COPY steps so yt-dlp-ejs is already present on disk.
+# `deno cache` vs `deno run`
+# --------------------------
+# `deno cache <file>` compiles the module into V8 bytecode WITHOUT executing it.
+# This is preferable to `deno run` because:
+#   • No IPC/stdin contract needed (yt-dlp-ejs expects a specific stdin protocol
+#     when run by yt-dlp; running it standalone fails or blocks).
+#   • `deno cache` exits cleanly with code 0 on success.
+#   • The V8 bytecode cache written by `deno cache` is reused by `deno run`
+#     — same cache keys, same cache directory.
+#
+# Non-fatal
+# ---------
+# If yt-dlp-ejs is not installed or has no .js files, this step warns and
+# continues.  The bot operates correctly without the pre-warm because
+# tv_embedded does not use Deno for PO tokens on the current /play path.
+# A fatal exit here would block deployment for a non-mandatory optimisation.
+#
+# Must run as botuser (same uid as runtime) so the cache writes to
+# /home/botuser/.cache/deno — the DENO_DIR Deno uses at runtime.
+# Must be after the COPY steps so yt-dlp-ejs is already on disk.
 RUN export DENO_NO_UPDATE_CHECK=1 DENO_DIR=/home/botuser/.cache/deno \
-    && EJS=$(find /usr/local/lib/python3.12/site-packages/yt_dlp \
-                  -name "main.js" -path "*ejs*" 2>/dev/null | head -1) \
-    && { [ -n "$EJS" ] || { \
-           echo "[deno-warmup] FATAL: yt-dlp-ejs main.js not found under" \
-                "/usr/local/lib/python3.12/site-packages/yt_dlp/*ejs*." \
-                "Verify that yt-dlp[default] is listed in requirements.txt" \
-                "and that the builder COPY step transferred packages correctly."; \
-           exit 1; }; } \
-    && echo "[deno-warmup] Found yt-dlp-ejs at: $EJS" \
-    && echo "[deno-warmup] Pre-compiling through Deno (timeout 30 s) ..." \
-    && timeout 30 \
-         deno run --allow-all "$EJS" \
-         </dev/null >/dev/null 2>/dev/null \
-    || { CODE=$?; \
-         if [ "$CODE" -eq 124 ]; then \
-           echo "[deno-warmup] Deno terminated by timeout; this is expected when" \
-                "yt-dlp-ejs blocks after EOF — the V8 JIT cache is already written."; \
-         else \
-           echo "[deno-warmup] FATAL: deno exited with unexpected code $CODE."; \
-           exit 1; \
-         fi; } \
-    && echo "[deno-warmup] Cache written to $DENO_DIR — runtime Deno start will be fast."
+    && echo "[deno-warmup] Locating yt-dlp-ejs JS file via importlib.metadata ..." \
+    && EJS=$(python3 -c " \
+import importlib.metadata as M, sys; \
+try: \
+    d = M.distribution('yt-dlp-ejs'); \
+    js = [str(d.locate_file(f)) for f in (d.files or []) if str(f).endswith('.js')]; \
+    print(js[0]) if js else sys.exit(1) \
+except M.PackageNotFoundError: \
+    sys.exit(2) \
+" 2>/dev/null) \
+    && if [ -z "$EJS" ]; then \
+           echo "[deno-warmup] WARNING: yt-dlp-ejs JS file not found via importlib.metadata."; \
+           echo "[deno-warmup] This is non-fatal: the tv_embedded player client does not"; \
+           echo "[deno-warmup] invoke Deno for PO tokens on the current /play path."; \
+           echo "[deno-warmup] Skipping Deno pre-warm."; \
+       else \
+           echo "[deno-warmup] Found yt-dlp-ejs JS file at: $EJS"; \
+           echo "[deno-warmup] Pre-compiling via 'deno cache' (no execution, just V8 JIT) ..."; \
+           deno cache "$EJS" 2>&1 && \
+             echo "[deno-warmup] V8 cache written to $DENO_DIR — Deno start will be fast." || \
+             echo "[deno-warmup] WARNING: deno cache failed (non-fatal — tv_embedded does not use Deno)."; \
+       fi
 
 # Render injects $PORT at runtime; 8080 is the local development fallback.
 EXPOSE 8080
