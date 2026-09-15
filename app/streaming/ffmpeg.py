@@ -34,14 +34,22 @@ The three flags used:
 These are passed via MediaStream(ffmpeg_parameters=...) which py-tgcalls 2.x
 forwards to the ntgcalls FFmpeg invocation as input options (before -i).
 
-Fallback path (build_from_youtube)
------------------------------------
-Called only when StreamResolver fails (e.g. age-restricted or geo-blocked
-video where even mweb/web cannot obtain a URL without authentication).
-Passes ytdlp_parameters to MediaStream so ntgcalls runs yt-dlp internally
-with the same mweb,web,tv_embedded client priority as the primary path.
-For age-gated or geo-blocked videos, valid cookies from a logged-in Google
-account are also required.
+Fallback path (build_from_youtube) — PRESERVED BUT NOT CALLED
+--------------------------------------------------------------
+build_from_youtube() exists as a potential future option for bypassing
+StreamResolver entirely and letting ntgcalls run yt-dlp internally.
+
+It is NOT called by PlaybackController in the current architecture.
+When StreamResolver returns None, PlaybackController raises StreamResolveError
+immediately — no fallback.  This is intentional: the ntgcalls-internal
+yt-dlp+Deno+FFmpeg path spawned unmanaged subprocesses that were not
+killed by leave_call(), leading to cumulative OOM on Render 512 MB after
+2–4 tracks.
+
+build_from_youtube() is kept for reference and potential controlled future
+use (e.g. a hypothetical /play --force-fallback debug command), but must NOT
+be silently reinstated as an automatic fallback without first solving the
+subprocess lifecycle problem.
 
 Stage log: [FFMPEG]
 """

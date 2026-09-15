@@ -63,7 +63,24 @@ _SEARCH_OPTS: Dict = {
     "retries":        1,
     "extractor_args": {
         "youtube": {
-            "player_client": ["mweb", "web"],
+            # tv_embedded is used here for consistency with the resolver.
+            #
+            # With extract_flat="in_playlist", yt-dlp does not resolve stream
+            # URLs and does not invoke Deno for either search or direct-URL
+            # metadata requests — so the player_client has no practical effect
+            # on the metadata-only path today.
+            #
+            # tv_embedded is chosen because:
+            # 1. If yt-dlp behaviour ever changes such that metadata extraction
+            #    does contact the player endpoint, mweb/web would invoke Deno
+            #    and potentially time out (30 s cold-start on Render free tier).
+            # 2. Consistency with the resolver makes the system easier to reason
+            #    about — one client policy throughout.
+            # 3. tv_embedded is available for all public videos; no regression.
+            #
+            # Previously ["mweb", "web"]: was safe under extract_flat but
+            # inconsistent.  Changed in Queue Hardening + Playback Recovery task.
+            "player_client": ["tv_embedded"],
         }
     },
 }

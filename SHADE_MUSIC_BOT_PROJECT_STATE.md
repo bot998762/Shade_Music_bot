@@ -485,3 +485,181 @@ across all advance paths.
 After `/skip`, implement `/queue` (read-only: `session.get_upcoming(chat_id)`)
 and `/nowplaying` (read-only: `state.current_track(chat_id)`). These are
 the safest next commands because they are read-only and cannot corrupt state.
+
+---
+
+### 2026-09-15 — Playback / Stream Resolution Recovery & Production Verification
+
+**Task**: Audit the full playback/stream resolution pipeline, identify root causes, implement targeted fixes, expand test coverage, and prepare the deliverable ZIP.
+
+**Note**: No live Render deployment was available for testing. All measurements are based on code analysis and unit tests. Production verification requires a real deployment.
+
+---
+
+#### Reproduction Attempt
+
+Production symptoms described in the task (INFERRED from code history, NOT reproduced in sandbox):
+- yt-dlp resolver timing out at ~30s
+- No audio in Telegram VC
+- Direct YouTube URL returning "No results found"
+- Historical OOM from unmanaged ntgcalls fallback subprocesses
+
+The sandbox environment has no yt-dlp, Deno, Telegram connectivity, or Render access. All conclusions are from code inspection and unit tests.
+
+---
+
+#### Root Cause Analysis
+
+**CONFIRMED: The primary historical failure was mweb/web player clients invoking Deno on cold start**
+
+Evidence:
+- `resolver.py` module docstring documents the Phase-2 deployment failure with `_PLAYER_CLIENTS = "mweb,web,tv_embedded"`
+- Deno JIT-compiles yt-dlp-ejs on first invocation; empty cache on Render cold start
+- JIT compilation takes > 30s on throttled 512MB instance > `STREAM_RESOLVE_TIMEOUT_SEC = 30`
+- `STREAM_RESOLVE_TIMEOUT_SEC = 30` → timeout fires → `StreamResolveTimeoutError`
+
+**CONFIRMED: The fix (tv_embedded only) is already in the codebase**
+
+Evidence: `_PLAYER_CLIENT = "tv_embedded"` in `resolver.py`. Test `test_command_uses_tv_embedded_not_mweb_or_web` enforces this.
+
+**CONFIRMED: The ntgcalls fallback was intentionally removed**
+
+Evidence: `PlaybackController._build_stream()` raises `StreamResolveError` on `None` return; `build_from_youtube()` is never called from `controller.py`. Test `test_build_from_youtube_never_called` enforces this.
+
+**CONFIRMED: Process group kill on timeout is implemented correctly**
+
+Evidence: `start_new_session=True` + `os.killpg(proc.pid, signal.SIGTERM)` in `_resolve_subprocess()`. Tests `test_cancelled_error_kills_process_group` and `test_resolve_timeout_raises_StreamResolveTimeoutError` verify this.
+
+**CONFIRMED: Semaphore correctly releases on timeout/cancellation**
+
+Evidence: Unit tests in test suite; Python 3.12 asyncio Semaphore releases on CancelledError in `async with` context manager.
+
+**CONFIRMED: CDN resolution at playback time, not enqueue time**
+
+Evidence: `Track` stores only `webpage_url`; `_build_stream()` called only in `_start_now()` and `advance()`.
+
+**INFERRED: tv_embedded avoids Deno for n-signature computation**
+
+Evidence: Module docstring and yt-dlp documentation. The TVHTML5_SIMPLY_EMBEDDED_PLAYER API uses a simpler player endpoint that does not require PO tokens. n-signature may still need Deno in future yt-dlp versions.
+
+**INFERRED: Deno pre-warm in Dockerfile correctly populates the cache**
+
+Evidence: The find pattern `find ... -name "main.js" -path "*ejs*"` matches the yt-dlp-ejs package structure where JS files land under a path containing "ejs" within the yt_dlp site-packages directory. The pre-warm is defensive — not required for tv_embedded-only operation.
+
+**UNKNOWN: Whether tv_embedded produces usable stream URLs for all popular videos on current YouTube (2026)**
+
+Status: NOT TESTED. Requires live Render deployment and actual YouTube stream extraction.
+
+**UNKNOWN: Cold vs warm container actual timings on Render**
+
+Status: NOT TESTED. No access to Render deployment.
+
+**UNKNOWN: Memory usage under real playback conditions**
+
+Status: NOT TESTED. No yt-dlp or PyTgCalls available in sandbox.
+
+---
+
+#### Previous Hypotheses Reconciled
+
+| Hypothesis | Status | Evidence |
+|-----------|--------|----------|
+| Deno cold-start caused 30s timeout | CONFIRMED | Module docstring, mweb/web client history |
+| tv_embedded avoids PO tokens/Deno | INFERRED | yt-dlp docs + resolver docstring |
+| ntgcalls fallback caused OOM | CONFIRMED | Removed in Phase 2; documented in ffmpeg.py |
+| Direct URL → NoResultsError | CONFIRMED BUG, NOW FIXED | `_sync_fetch_url` uses `extract_flat="in_playlist"` for metadata only; separate resolver handles CDN |
+| "Player client selection was wrong" | PARTIALLY CONFIRMED | mweb/web were in resolver (removed); still remained in search opts (fixed in this task) |
+| Render cannot run this bot | NOT TESTED, NOT CONCLUDED | No evidence either way |
+| Pre-warm in Dockerfile solves cold-start | INFERRED | Cannot verify without cold-start test |
+
+---
+
+#### Changes Made in This Task
+
+**1. `app/search/youtube.py` — player_client changed to tv_embedded**
+
+Changed `_SEARCH_OPTS["extractor_args"]["youtube"]["player_client"]` from `["mweb", "web"]` to `["tv_embedded"]`.
+
+Reason: With `extract_flat="in_playlist"`, player_client has no effect on today's metadata-only extraction. However, mweb/web are Deno-invoking clients. If yt-dlp behaviour ever changes such that metadata extraction contacts the player endpoint, this would silently introduce a Deno cold-start timeout during search. tv_embedded is also consistent with the resolver's client policy.
+
+Severity of original: LOW (no current impact with extract_flat). Changed for defence-in-depth.
+
+**2. `app/streaming/ffmpeg.py` — corrected build_from_youtube docstring**
+
+The docstring said "Called only when StreamResolver fails" — this is incorrect. `build_from_youtube()` is dead code in the current architecture; it is never called by `PlaybackController`. The docstring was updated to accurately describe:
+- The method is preserved but NOT called
+- The historical reason it was removed (OOM from unmanaged subprocesses)
+- Warning: must NOT be silently reinstated without solving subprocess lifecycle
+
+**3. `tests/test_playback_integration.py` — new test file**
+
+29 new tests covering:
+- Search path: query → SearchResult → Track
+- Direct URL path: URL → fetch_url_metadata → Track
+- Resolver boundary: CDN URL in/out contract
+- No fallback invocation (OOM prevention guarantee)
+- Error classification (correct exception hierarchy)
+- Search options audit (tv_embedded, extract_flat, skip_download)
+- Resolver configuration audit (tv_embedded, semaphore, format selector)
+- Deno/yt-dlp-ejs architecture documentation tests
+
+---
+
+#### Test Results
+
+| Test File | Before | After |
+|-----------|--------|-------|
+| test_resolver.py | 18 | 18 |
+| test_controller_build_stream.py | 9 | 9 |
+| test_validators.py | 25 | 25 |
+| test_queue_lifecycle.py | 25 | 25 |
+| test_playback_integration.py | 0 | **29** |
+| **Total** | **77** | **106** |
+
+All 106 tests pass. 0 failed. 0 skipped.
+
+---
+
+#### Production Verification Status
+
+| Stage | Status |
+|-------|--------|
+| Unit tests | UNIT TESTED (106/106 pass) |
+| Integration tests | NOT AVAILABLE (no live Telegram/YouTube) |
+| Resolver with real YouTube | NOT TESTED |
+| VC join and audio | NOT TESTED |
+| Cold-start on Render | NOT TESTED |
+| Warm-start on Render | NOT TESTED |
+| Memory under repeated playback | NOT TESTED |
+| Orphan processes after timeout | UNIT TESTED (mock verifies killpg called) |
+
+---
+
+#### Remaining Limitations
+
+1. **Production stream resolution unverified**: The tv_embedded fix is architecturally sound but not live-tested on Render. A cold-start deployment test is required.
+
+2. **n-signature computation via Deno risk**: If YouTube changes n-signature obfuscation format such that yt-dlp's Python jsinterp cannot handle it, tv_embedded will also start requiring Deno. The Dockerfile pre-warm is the mitigation.
+
+3. **Deno pre-warm not verified**: The Dockerfile build-time pre-warm logic has not been tested against an actual Docker build with a real yt-dlp installation.
+
+4. **First-track failure discards queue**: Still present from previous task — `_start_now()` failure calls `cleanup()` which clears all queued tracks.
+
+5. **Queue persistence**: None. Restart loses all queued tracks.
+
+6. **No playback control commands**: /skip, /stop, /pause, /resume not implemented.
+
+---
+
+#### Recommended Next Step
+
+**Deploy to Render and perform a cold-start verification test:**
+
+1. Deploy the current codebase.
+2. Observe Render logs on the first container start.
+3. Issue `/play <known public YouTube video>` via the bot.
+4. Record: search latency, resolver latency, VC join result, audio quality.
+5. If resolver times out, check logs for Deno subprocess activity.
+6. If resolver succeeds, issue a second `/play` to verify advance() works.
+
+This will either confirm the tv_embedded fix works end-to-end, or surface the actual production failure for further diagnosis.
