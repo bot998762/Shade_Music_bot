@@ -135,7 +135,7 @@ USER botuser
 # Must be after the COPY steps so yt-dlp-ejs is already on disk.
 RUN export DENO_NO_UPDATE_CHECK=1 DENO_DIR=/home/botuser/.cache/deno \
     && echo "[deno-warmup] Locating yt-dlp-ejs JS file via importlib.metadata ..." \
-    && EJS=$(python3 -c " \
+    && if EJS=$(python3 -c " \
 import importlib.metadata as M, sys; \
 try: \
     d = M.distribution('yt-dlp-ejs'); \
@@ -143,18 +143,16 @@ try: \
     print(js[0]) if js else sys.exit(1) \
 except M.PackageNotFoundError: \
     sys.exit(2) \
-" 2>/dev/null) \
-    && if [ -z "$EJS" ]; then \
-           echo "[deno-warmup] WARNING: yt-dlp-ejs JS file not found via importlib.metadata."; \
-           echo "[deno-warmup] This is non-fatal: the tv_embedded player client does not"; \
-           echo "[deno-warmup] invoke Deno for PO tokens on the current /play path."; \
-           echo "[deno-warmup] Skipping Deno pre-warm."; \
-       else \
+" 2>/dev/null); then \
            echo "[deno-warmup] Found yt-dlp-ejs JS file at: $EJS"; \
            echo "[deno-warmup] Pre-compiling via 'deno cache' (no execution, just V8 JIT) ..."; \
-           deno cache "$EJS" 2>&1 && \
-             echo "[deno-warmup] V8 cache written to $DENO_DIR — Deno start will be fast." || \
-             echo "[deno-warmup] WARNING: deno cache failed (non-fatal — tv_embedded does not use Deno)."; \
+           deno cache "$EJS" 2>&1 \
+             && echo "[deno-warmup] V8 cache written to $DENO_DIR — Deno start will be fast." \
+             || echo "[deno-warmup] WARNING: deno cache failed (non-fatal — tv_embedded does not require Deno)."; \
+       else \
+           echo "[deno-warmup] WARNING: yt-dlp-ejs JS file not found via importlib.metadata."; \
+           echo "[deno-warmup] Non-fatal: tv_embedded does not invoke Deno for PO tokens."; \
+           echo "[deno-warmup] Skipping Deno pre-warm."; \
        fi
 
 # Render injects $PORT at runtime; 8080 is the local development fallback.
