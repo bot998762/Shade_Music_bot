@@ -77,6 +77,23 @@ Contract
   FAILURE   → None (yt-dlp exited non-zero; caller raises StreamResolveError)
   TIMEOUT   → raises StreamResolveTimeoutError (yt-dlp process killed)
 
+Diagnostic mode (TEMPORARY)
+----------------------------
+_DIAGNOSTIC is True in this build.  When True:
+  - ``--verbose`` replaces ``--quiet``/``--no-warnings`` so yt-dlp emits its
+    full internal trace to stderr.
+  - On timeout, after the process group is killed, the resolver drains
+    whatever partial stdout/stderr the subprocess had already written to its
+    pipe buffers and logs it at ERROR level under the [RESOLVE][DIAGNOSTIC]
+    prefix.
+  - The pipe drain has its own 3-second timeout so it can never block the
+    event loop or delay cleanup.
+  - Process-group kill, process reaping, semaphore release, and the
+    no-ghost-process guarantee are all unchanged.
+
+Set _DIAGNOSTIC = False and restore --quiet/--no-warnings to return to
+normal silent operation once the root cause has been identified.
+
 Stage log: [RESOLVE]
 """
 
@@ -94,6 +111,30 @@ from app.shared.constants import (
     STREAM_RESOLVE_TIMEOUT_SEC,
 )
 from app.shared.exceptions import StreamResolveTimeoutError
+
+# ── Diagnostic mode ────────────────────────────────────────────────────────────
+# TEMPORARY — set False once the timeout root cause has been identified.
+#
+# When True:
+#   • ``--verbose`` is added to the yt-dlp command in place of
+#     ``--quiet``/``--no-warnings``.  yt-dlp then emits its full internal
+#     trace (HTTP requests, player JS download, n-signature steps, Deno
+#     invocation, format selection, etc.) to stderr.
+#   • On timeout, the partial stderr (and stdout) that the subprocess wrote
+#     before it was killed are drained from the pipe buffers and logged.
+#   • Extraction behaviour is unchanged — same player client, same format
+#     selector, same timeout, same kill semantics.
+#
+# Must be False in normal production to avoid leaking internal yt-dlp traces
+# in logs and to keep log volume manageable.
+_DIAGNOSTIC: bool = True
+
+# ── Pipe-drain timeout ─────────────────────────────────────────────────────────
+# After killing the subprocess on timeout, we have this many seconds to drain
+# whatever the process had already written to its stdout/stderr buffers.
+# 3 seconds is generous; the kernel flushes pipe buffers immediately on process
+# exit, so in practice the read is nearly instantaneous.
+_DRAIN_TIMEOUT_SEC: float = 3.0
 
 # ── Format selector ────────────────────────────────────────────────────────────
 # Priority 1: best audio-only stream with an actual codec (DASH m4a/opus)
@@ -238,6 +279,7 @@ class StreamResolver:
 
         Result: no orphaned processes, no ghost memory.
         """
+        # ── Build command ─────────────────────────────────────────────────────
         cmd: list[str] = [
             "yt-dlp",
             "--format",         _YDL_FORMAT,
@@ -246,17 +288,24 @@ class StreamResolver:
             "--socket-timeout", "10",
             "--retries",        "1",
             "--extractor-args", f"youtube:player_client={_PLAYER_CLIENT}",
-            "--quiet",
-            "--no-warnings",
             "--print",          "url",
         ]
+        if _DIAGNOSTIC:
+            # --verbose replaces --quiet/--no-warnings.
+            # yt-dlp emits its full internal trace to stderr:
+            # HTTP requests, player JS URL, n-signature steps, Deno
+            # invocation, format selection, cookies status, etc.
+            cmd.append("--verbose")
+        else:
+            cmd += ["--quiet", "--no-warnings"]
+
         if self._cookies_path:
             cmd += ["--cookies", self._cookies_path]
         cmd.append(webpage_url)
 
         logger.debug(
-            "[RESOLVE] Spawning yt-dlp  client={}  url='{}'",
-            _PLAYER_CLIENT, webpage_url,
+            "[RESOLVE] Spawning yt-dlp  client={}  diagnostic={}  url='{}'",
+            _PLAYER_CLIENT, _DIAGNOSTIC, webpage_url,
         )
 
         proc = await asyncio.create_subprocess_exec(
@@ -275,6 +324,16 @@ class StreamResolver:
             # Kill yt-dlp (and any child it spawned) before propagating so no
             # processes are orphaned.
             _kill_proc_group(proc)
+
+            if _DIAGNOSTIC:
+                # Drain whatever partial output the subprocess had already
+                # written to its pipe buffers before it was killed.
+                # The process is dead (or dying) so the read completes as
+                # soon as the kernel flushes the pipe — typically < 1 ms.
+                # _DRAIN_TIMEOUT_SEC caps the wait so this can never stall.
+                stdout, stderr = await _drain_pipes(proc)
+                _log_diagnostic_output(webpage_url, stdout, stderr)
+
             raise
 
         if proc.returncode != 0:
@@ -325,6 +384,103 @@ def _kill_proc_group(proc: asyncio.subprocess.Process) -> None:
             proc.kill()
         except (ProcessLookupError, PermissionError):
             pass
+
+
+async def _drain_pipes(
+    proc: asyncio.subprocess.Process,
+) -> tuple[bytes, bytes]:
+    """
+    Read whatever partial output the subprocess wrote before being killed.
+
+    Called only on the timeout/cancel path, after _kill_proc_group().
+    The process is already dead (or about to exit); the pipe buffers are
+    frozen.  Reading them is nearly instantaneous.
+
+    A _DRAIN_TIMEOUT_SEC asyncio timeout guards against the unlikely case
+    where a pipe read would block (e.g. the process is still running despite
+    the SIGTERM).  On timeout the drain silently returns whatever was
+    collected so far — no exception is propagated, and the original
+    CancelledError is still re-raised by the caller.
+
+    Returns (stdout_bytes, stderr_bytes).  Both may be empty.
+    Never raises.
+    """
+    try:
+        stdout_data, stderr_data = await asyncio.wait_for(
+            _read_pipes(proc),
+            timeout=_DRAIN_TIMEOUT_SEC,
+        )
+        return stdout_data, stderr_data
+    except Exception:
+        # asyncio.TimeoutError or anything else — return what we have.
+        return b"", b""
+
+
+async def _read_pipes(
+    proc: asyncio.subprocess.Process,
+) -> tuple[bytes, bytes]:
+    """Read stdout and stderr pipes concurrently."""
+    stdout_task = asyncio.create_task(_read_one(proc.stdout))
+    stderr_task = asyncio.create_task(_read_one(proc.stderr))
+    stdout_data = await stdout_task
+    stderr_data = await stderr_task
+    return stdout_data, stderr_data
+
+
+async def _read_one(stream: Optional[asyncio.StreamReader]) -> bytes:
+    """Read all available bytes from a stream, or return b'' if None."""
+    if stream is None:
+        return b""
+    try:
+        return await stream.read(-1)   # -1 = read until EOF
+    except Exception:
+        return b""
+
+
+def _log_diagnostic_output(
+    webpage_url: str,
+    stdout: bytes,
+    stderr: bytes,
+) -> None:
+    """
+    Log partial yt-dlp output captured after a timeout.
+
+    Truncates to 4 000 bytes each, preserving the head (most useful for
+    identifying which step stalled) and the tail (most useful for seeing
+    the last thing yt-dlp attempted).  Cookies, tokens, and CDN secrets
+    are already redacted by the byte limit — full cookie file contents
+    are never echoed by yt-dlp --verbose.
+
+    The [RESOLVE][DIAGNOSTIC] prefix makes these lines easy to grep for.
+    """
+    # Decode safely — yt-dlp output is UTF-8 with occasional binary noise.
+    stderr_str = stderr.decode(errors="replace").strip()
+    stdout_str = stdout.decode(errors="replace").strip()
+
+    _MAX = 4000   # bytes per stream — enough for a full yt-dlp trace
+
+    def _truncate(text: str, label: str) -> str:
+        if not text:
+            return f"<empty>"
+        if len(text) <= _MAX:
+            return text
+        head = text[:_MAX // 2]
+        tail = text[-_MAX // 2:]
+        omitted = len(text) - _MAX
+        return f"{head}\n... [{omitted} chars omitted] ...\n{tail}"
+
+    logger.error(
+        "[RESOLVE][DIAGNOSTIC] yt-dlp did not complete within timeout.\n"
+        "  url        : {}\n"
+        "  client     : {}\n"
+        "  diagnostic : verbose mode active\n"
+        "─── stderr (yt-dlp internal trace) ───\n{}\n"
+        "─── stdout (partial URL output) ───\n{}",
+        webpage_url,
+        _PLAYER_CLIENT,
+        _truncate(stderr_str, "stderr"),
+        _truncate(stdout_str, "stdout"),
+    )
 
 
 def _resolve_cookies_tmp(cookies_path: Optional[str]) -> Optional[str]:

@@ -890,3 +890,82 @@ Shell logic verified with `/bin/sh` directly. The corrected `if EJS=$(...)` patt
 - Whether the Render Docker image's `/bin/sh` is dash (POSIX) or bash — both were tested and behave identically for this pattern.
 - Whether `deno cache` (vs `deno run`) correctly warms the V8 cache that yt-dlp uses at runtime.
 - Whether yt-dlp-ejs is present in the `yt-dlp[default]>=2026.07.04` installation on Render.
+
+---
+
+### 2026-09-16 — Resolver Diagnostic Instrumentation (TEMPORARY)
+
+**Reason**: Production deployment succeeds and bot is operational, but yt-dlp stream resolution times out at exactly 30 seconds on every `/play` attempt. The exact internal stage responsible is UNKNOWN — stderr was silently discarded on the timeout path, leaving zero diagnostic evidence.
+
+**This is a diagnostic deployment, not a fix.**
+
+---
+
+#### What was added
+
+**`app/search/resolver.py`** — two targeted changes:
+
+1. `_DIAGNOSTIC = True` constant. When True:
+   - `--verbose` replaces `--quiet`/`--no-warnings` in the yt-dlp subprocess command.
+   - yt-dlp emits its complete internal trace to stderr: HTTP requests, player JS download, n-signature steps, Deno invocation (if any), format selection, etc.
+
+2. Timeout path now drains and logs partial subprocess output:
+   - After `_kill_proc_group()`, `_drain_pipes()` reads whatever the subprocess had written to its stdout/stderr pipe buffers before being killed.
+   - Drain has its own 3-second timeout (`_DRAIN_TIMEOUT_SEC`) so it cannot stall the event loop.
+   - `_log_diagnostic_output()` logs captured output at ERROR level under `[RESOLVE][DIAGNOSTIC]` prefix.
+   - Kill happens before drain (process must be dead so pipes return EOF promptly).
+   - `StreamResolveTimeoutError` is still raised after drain — no behavior change to callers.
+
+**No other files changed.** Player client, format selector, timeout value, retry policy, queue, controller, playback, Dockerfile, Deno configuration, requirements.txt: all unchanged.
+
+---
+
+#### What is intentionally NOT changed
+
+- `_PLAYER_CLIENT = "tv_embedded"` — unchanged
+- `_YDL_FORMAT` — unchanged
+- `STREAM_RESOLVE_TIMEOUT_SEC = 30` — unchanged
+- `--retries 1`, `--socket-timeout 10` — unchanged
+- `_RESOLVE_SEMAPHORE` and process-group kill — unchanged
+- Queue, SessionManager, PlaybackController — untouched
+- Dockerfile, Deno pre-warm — untouched
+
+---
+
+#### Tests
+
+| Before | After |
+|--------|-------|
+| 106 | 117 |
+
+11 new tests in `tests/test_resolver.py` (class `TestDiagnosticMode`) covering:
+- `_DIAGNOSTIC` is enabled
+- `--verbose` replaces `--quiet`/`--no-warnings`
+- Normal mode still uses `--quiet`/`--no-warnings`
+- Timeout still raises `StreamResolveTimeoutError`
+- `_kill_proc_group()` called before pipe drain
+- Semaphore released after diagnostic timeout
+- Stalled pipe drain bounded by `_DRAIN_TIMEOUT_SEC`
+- No credentials in `_log_diagnostic_output` signature
+- Success path unchanged in diagnostic mode
+- `_DRAIN_TIMEOUT_SEC` is a positive finite value
+
+All 117 tests pass.
+
+---
+
+#### Root cause status
+
+CONFIRMED: yt-dlp subprocess does not complete stream extraction within 30 seconds.
+
+UNKNOWN: the internal stage responsible.
+
+The diagnostic deployment will produce `[RESOLVE][DIAGNOSTIC]` log entries on the next `/play` attempt. The stderr trace will identify whether Deno is invoked, which extraction step stalls, and what HTTP activity occurred before the timeout.
+
+---
+
+#### To disable diagnostic mode after root cause is found
+
+1. Set `_DIAGNOSTIC = False` in `app/search/resolver.py`.
+2. Remove or leave the diagnostic helpers (`_drain_pipes`, `_read_pipes`, `_read_one`, `_log_diagnostic_output`) — they are no-ops when `_DIAGNOSTIC = False`.
+3. Redeploy.
