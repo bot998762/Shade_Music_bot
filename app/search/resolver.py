@@ -105,6 +105,7 @@ import signal
 from typing import Optional
 
 from app.infrastructure.logger import logger
+from app.infrastructure.memprobe import log_memory, poll_memory_during
 from app.shared.constants import (
     COOKIES_SECRETS_DIR,
     COOKIES_TMP_DIR,
@@ -216,7 +217,15 @@ class StreamResolver:
         """
         logger.debug("[RESOLVE] Resolving stream URL for: {}", webpage_url)
 
+        # [MEM DIAGNOSTIC] Measure before acquiring semaphore
+        log_memory("BEFORE_RESOLVE")
+
         async with _RESOLVE_SEMAPHORE:
+            # [MEM DIAGNOSTIC] Start background polling task to capture peak during Deno JIT
+            _stop_poll = asyncio.Event()
+            _poll_task = asyncio.create_task(
+                poll_memory_during("DURING_RESOLVE", interval_sec=5.0, stop_event=_stop_poll)
+            )
             try:
                 url = await asyncio.wait_for(
                     self._resolve_subprocess(webpage_url),
@@ -245,6 +254,15 @@ class StreamResolver:
                 raise StreamResolveTimeoutError(
                     f"Stream resolution timed out for: {webpage_url}"
                 )
+            finally:
+                # [MEM DIAGNOSTIC] Stop the polling task and take final snapshot
+                _stop_poll.set()
+                _poll_task.cancel()
+                try:
+                    await asyncio.wait_for(asyncio.shield(_poll_task), timeout=1.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+                log_memory("AFTER_RESOLVE")
 
     @staticmethod
     def shutdown() -> None:

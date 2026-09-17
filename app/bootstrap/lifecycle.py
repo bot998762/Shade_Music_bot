@@ -143,6 +143,14 @@ class ApplicationLifecycle:
         logger.info("  All systems operational")
         logger.info("=" * 60)
 
+        # [MEM DIAGNOSTIC] Baseline memory snapshot + Deno cache state at startup.
+        # This tells us: (a) how much RAM the bot uses before any /play,
+        # (b) whether the pre-warm populated the Deno gen/ cache,
+        # (c) whether v8_code_cache_v* exists (warm Deno) or not (cold Deno).
+        from app.infrastructure.memprobe import log_deno_cache, log_memory
+        log_deno_cache("STARTUP")
+        log_memory("STARTUP_BASELINE")
+
     async def stop(self) -> None:
         """Shut down all sub-systems in reverse startup order."""
         logger.info("[SHUTDOWN] Starting graceful shutdown...")
