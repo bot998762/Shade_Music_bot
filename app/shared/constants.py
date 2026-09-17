@@ -22,7 +22,7 @@ DEFAULT_VOLUME:         int = 100
 
 # ── Timeouts (seconds) ────────────────────────────────────────────────────────
 SEARCH_TIMEOUT_SEC:         int = 20
-STREAM_RESOLVE_TIMEOUT_SEC: int = 30
+STREAM_RESOLVE_TIMEOUT_SEC: int = 90  # DIAGNOSTIC: temporarily increased from 30 to test cold Deno JIT hypothesis
 
 # ── Thread executor ───────────────────────────────────────────────────────────
 YT_EXECUTOR_WORKERS:    int = 1
