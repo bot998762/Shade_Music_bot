@@ -41,7 +41,7 @@ ntgcalls==2.2.5
 # yt-dlp runs inside Deno to solve YouTube's n-signature and PO-token
 # challenges.  Without it, YouTube extraction falls back to a deprecated
 # limited mode and will eventually stop working entirely.
-yt-dlp[default]>=2026.07.04
+yt-dlp>=2026.07.04
 
 # ─── Database ──────────────────────────────────────────────────────────────────
 motor==3.4.0
