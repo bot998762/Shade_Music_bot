@@ -969,3 +969,215 @@ The diagnostic deployment will produce `[RESOLVE][DIAGNOSTIC]` log entries on th
 1. Set `_DIAGNOSTIC = False` in `app/search/resolver.py`.
 2. Remove or leave the diagnostic helpers (`_drain_pipes`, `_read_pipes`, `_read_one`, `_log_diagnostic_output`) — they are no-ops when `_DIAGNOSTIC = False`.
 3. Redeploy.
+
+---
+
+### 2026-09-19 — Deno Wrapper / V8 Code-Cache Forensic Investigation
+
+**Background**: Previous diagnostic deployment confirmed that yt-dlp invokes Deno for YouTube n-signature computation via yt-dlp-ejs v0.8.0, with the flag `--no-code-cache` hardcoded in yt-dlp's source. Deno peaked at ~264 MB RSS and total tracked memory at ~511 MB, causing OOM events on Render 512 MB when concurrent FFmpeg streams were active.
+
+---
+
+#### Why this investigation happened
+
+- The resolver timeout was raised to 90s to allow Deno's cold JIT to complete. Extraction succeeded but Deno RSS peaked at ~264 MB.
+- OOM events occurred at 7:53 AM and 8:12 AM when concurrent voice sessions ran alongside Deno extraction.
+- The V8 code-cache warm-up via `deno cache` was identified as insufficient: `deno cache` populates `gen/` (module bytecode) but NOT `v8_code_cache_v*/` (the cache that `deno run` reads at startup).
+- `--no-code-cache` in yt-dlp's hardcoded Deno invocation disables the V8 code cache entirely, making every Deno run cold regardless of any pre-warm.
+- A wrapper to strip `--no-code-cache` and a corrected pre-warm (`deno run` instead of `deno cache`) were investigated as a potential memory optimisation.
+
+---
+
+#### Experiment: Option 6 — Remove yt-dlp-ejs
+
+Changed `requirements.txt`: `yt-dlp[default]>=2026.07.04` → `yt-dlp>=2026.07.04`
+
+**Result: FAILED.**
+
+- Deno was never spawned (confirmed by memprobe — no `deno[N]` in any poll snapshot).
+- yt-dlp's Python jsinterp handled the extraction attempt.
+- After ~35 seconds, yt-dlp exited code 1: "Requested format is not available."
+- Identical format selector succeeded with yt-dlp-ejs present.
+- Root cause: Python jsinterp does not produce a valid n-signature for current YouTube (2026.08.19). CDN URLs from the incorrect n-sig return HTTP 403; yt-dlp retries and eventually fails.
+- **yt-dlp-ejs / Deno is required for successful YouTube extraction with the current yt-dlp version.**
+- Reverted immediately.
+
+---
+
+#### Experiment: Option 1 — Deno Wrapper
+
+**Files changed:** `Dockerfile` only.
+
+Two targeted changes:
+
+1. Rename `/usr/local/bin/deno` → `/usr/local/bin/deno.real`. Install a Python wrapper at `/usr/local/bin/deno`:
+   ```python
+   #!/usr/bin/env python3
+   import sys, os
+   args = [a for a in sys.argv[1:] if a != "--no-code-cache"]
+   os.execv("/usr/local/bin/deno.real", ["/usr/local/bin/deno.real"] + args)
+   ```
+   `os.execv` replaces the wrapper process entirely — stdin/stdout/stderr, process group, and exit code are all inherited unchanged by `deno.real`. The `killpg()` path for resolver timeout correctly kills `deno.real`, not just the wrapper.
+
+2. Update pre-warm from `deno cache "$EJS"` → `timeout 30 deno run "$EJS" </dev/null >/dev/null 2>&1`. The pre-warm now goes through the wrapper (no `--no-code-cache`), running `deno.real run "$EJS"` which should write `v8_code_cache_v*/` on clean exit.
+
+**Reversibility**: Two-line Dockerfile change. Remove wrapper `RUN`, rename `deno.real` back to `deno`. No Python application code changes.
+
+---
+
+#### Production Measurements (wrapper experiment)
+
+| Measurement | Result |
+|---|---:|
+| Deno RSS at t+15s (wrapper) | ~145.0 MB |
+| Deno RSS at t+15s (cold, no-code-cache) | ~202.8 MB |
+| Deno RSS at t+20s (wrapper) | ~261.5 MB |
+| Deno RSS at t+20s (cold, no-code-cache) | ~264.0 MB |
+| Tracked VmRSS sum at t+20s | ~523.6 MB |
+| Post-resolve tracked total | ~160.8 MB |
+| Resolution elapsed | ~25 seconds |
+| Extraction result | SUCCEEDED |
+| Playback result | SUCCEEDED |
+
+**Memory note**: 523.6 MB is a sum of per-process VmRSS values from `/proc/[pid]/status`. Linux shared library pages (libc, libssl, etc.) are counted once per process that maps them. Estimated double-counting: ~40–60 MB. Estimated actual unique physical RAM at peak (single idle group, no concurrent FFmpeg): ~484 MB — below the 512 MB cgroup limit. This specific test did not trigger OOM.
+
+---
+
+#### Findings
+
+**CONFIRMED:**
+
+- The wrapper executes correctly. Production log shows: `deno.real run --ext=js --no-prompt --no-remote --no-lock ...` — `--no-code-cache` is absent.
+- `os.execv` semantics are preserved. Extraction succeeded; playback started.
+- Deno RSS at t+15s was 57.8 MB lower with the wrapper (145.0 vs 202.8 MB).
+- Deno RSS at t+20s converged to ~261.5 MB vs ~264.0 MB — a 2.5 MB difference, within measurement noise.
+- The wrapper does not materially reduce the Deno peak RSS (~261 MB with or without the wrapper).
+- yt-dlp and Deno exit cleanly after resolve. All memory returns to baseline. No leak.
+- Post-resolve tracked total: 160.8 MB — confirms clean process exit.
+- The current yt-dlp-ejs/Deno n-signature execution path has a large ~260 MB Deno peak, and removing `--no-code-cache` does not materially reduce that peak.
+- With one concurrent active FFmpeg stream (~59.3 MB), estimated actual RAM reaches ~534–543 MB — likely triggering OOM on 512 MB.
+
+**INFERRED:**
+
+- The 57.8 MB lower reading at t+15s is consistent with V8 code cache being used during Deno startup (less temporary JIT compilation memory). Not directly proven.
+- The ~261 MB Deno peak is dominated by the n-signature JavaScript execution heap, not JIT compilation overhead. Both cold and warm paths converge to the same peak because the n-sig computation allocates the same JavaScript objects regardless of compilation path.
+- The 3-second faster resolution time (~25s vs ~22s baseline, within noise) is marginally consistent with less cold-start overhead.
+- The wrapper experiment did not OOM because it tested a single `/play` from an idle bot — the best-case scenario. Multi-group production use would require concurrent FFmpeg streams and would likely still OOM.
+
+**UNKNOWN:**
+
+- `[MEM][STARTUP][DENO_CACHE]` result for the wrapper deployment: does `v8_code_cache_v*/` exist at runtime startup? (startup log not captured for this experiment.)
+- Docker build `[deno-warmup]` exit code: did `timeout 30 deno run "$EJS"` exit 0, 1, or 124? Exit 124 (SIGTERM) means the pre-warm was killed before the V8 code cache was flushed to disk. (Build log not captured.)
+- True Deno RSS peak: the t+20s measurement at 261.5 MB is 5 seconds before resolution completed. The absolute peak between t+20s and t+25s is unmeasured.
+- Exact PSS (Proportional Set Size): actual unique physical RAM requires `/proc/[pid]/smaps_rollup`. The ~40 MB shared-page estimate is unverified.
+
+---
+
+#### Engineering Decision: Keep or Revert the Wrapper
+
+**Decision: KEEP the wrapper.**
+
+Justification:
+
+1. **Functional correctness is confirmed.** The wrapper is transparent to yt-dlp, does not affect the IPC protocol, does not weaken security flags (`--no-remote`, `--no-local-npm` still pass through), and playback succeeds.
+
+2. **It provides measurable early-phase benefit.** The 57.8 MB lower RSS at t+15s is a real reduction in the JIT/startup phase, even if the peak converges. This reduces the duration during which memory pressure is highest, which slightly reduces OOM probability during the rising phase of extraction.
+
+3. **No operational risk.** `os.execv` semantics are proven. Reverting requires one Dockerfile change. No Python application code is affected.
+
+4. **The wrapper correctly describes the architecture.** yt-dlp's `--no-code-cache` is a conservative design choice for general-purpose CLI deployments, not a requirement for our isolated container. Removing it is architecturally sound.
+
+5. **The wrapper does not solve the 512 MB constraint.** This is explicitly acknowledged. Keeping it is not a claim that the memory problem is resolved. The peak Deno RSS (~261 MB) remains the same.
+
+6. **Further V8 cache optimisation is not currently justified as a peak-memory solution.** The forensic evidence shows the peak is execution-dominated. No additional wrapper changes are expected to materially reduce it.
+
+---
+
+#### Remaining Limitations
+
+- 512 MB Render free tier is insufficient for reliable multi-group concurrent playback + extraction.
+- The peak memory during Deno n-sig execution (~261 MB Deno + ~101 MB yt-dlp + ~161 MB Python = ~523 MB tracked) leaves no headroom for concurrent FFmpeg streams.
+- Startup `DENO_CACHE` and build warmup exit code remain unconfirmed — but this uncertainty does not change the peak-memory conclusion.
+- The resolver timeout is currently 30s (restored after the 90s diagnostic experiment). Deno extraction took ~25s in the wrapper experiment. This leaves ~5s margin, which is tight.
+
+---
+
+## NEXT DECISION REQUIRED
+
+Determine the required production memory envelope for the intended concurrency model before changing infrastructure.
+
+The next investigation should establish:
+
+- Number of simultaneous voice chats the bot should reliably support
+- Whether yt-dlp extraction can overlap with active playback (it currently can — semaphore limits to 1 concurrent resolve, but FFmpeg streams continue running)
+- Maximum concurrent yt-dlp resolver processes (currently 1, enforced by semaphore)
+- Measured FFmpeg RSS while actively streaming (confirmed: ~59.3 MB per active VC)
+- Memory profile with multiple simultaneous active voice sessions (2 groups, 3 groups)
+- Whether resolver concurrency should remain at 1 or be further gated
+- Required headroom for Telegram/PyTgCalls/MongoDB/Python above the ~161 MB baseline
+- Whether a deployment memory tier of 1 GB provides sufficient headroom for the target concurrency model
+
+---
+
+### 2026-09-19 — Phase 2 Memory Instrumentation (PSS + cgroup + 1-second polling)
+
+**Purpose**: The previous forensic audit used RSS-only measurements and 5-second polling intervals. These left three critical evidence gaps:
+1. RSS overcounts shared pages — actual container memory was unknown
+2. 5-second polling missed the true Deno peak (resolve completes at ~t+25s)
+3. No cgroup data — the kernel's own container memory accounting was absent
+4. PSS (Proportional Set Size) was never measured — the only metric that correctly represents unique physical RAM cost per process
+
+**This entry records the instrumentation changes only. Actual production measurements are NOT yet collected — this is the deployment for measurement.**
+
+---
+
+#### Files Changed
+
+| File | Change |
+|---|---|
+| `app/infrastructure/memprobe.py` | Added PSS reading via `/proc/<pid>/smaps_rollup`. Added cgroup v1 and v2 reading. Added PPID + PGID to process records for process-tree verification. Changed default poll interval from 5.0s to 1.0s. Added `log_cgroup_only()` for cheap container-level snapshots. No behaviour changes. |
+| `app/search/resolver.py` | Changed `interval_sec=5.0` → `interval_sec=1.0` in `poll_memory_during()` call. No other changes. |
+| `app/bootstrap/lifecycle.py` | Added `log_cgroup_only("STARTUP_CGROUP")` after existing startup measurements. |
+
+**No behaviour changes. No playback, resolver, timeout, concurrency, or architecture changes.**
+
+---
+
+#### What each new measurement provides
+
+| Metric | Source | What it tells us |
+|---|---|---|
+| PSS per process | `/proc/<pid>/smaps_rollup` → `Pss:` | Proportional RAM cost; eliminates shared-page double-counting |
+| Private_Dirty per process | `smaps_rollup` | Memory unique to this process that has been modified; cannot be freed without writing |
+| cgroup current | `/sys/fs/cgroup/memory/memory.usage_in_bytes` | Kernel's total container RAM accounting — most authoritative |
+| cgroup peak | `/sys/fs/cgroup/memory/memory.max_usage_in_bytes` | Historical maximum container RAM this session |
+| cgroup limit | `memory.limit_in_bytes` | Actual configured container limit (confirms 512 MB / 1 GB) |
+| PPID/PGID | `/proc/<pid>/status` | Confirms yt-dlp → Deno process-group membership |
+| 1s poll interval | `poll_memory_during` | Captures true Deno peak between the previous t+20s and t+25s samples |
+
+---
+
+#### Scenarios to measure with this deployment
+
+**Scenario A (idle baseline):** Start the bot, do not play anything. Record `[MEM][STARTUP_BASELINE]` and `[MEM][STARTUP_CGROUP]` log lines.
+
+**Scenario B (0 VCs + resolver):** `/play phool` from idle. Collect all `[MEM][DURING_RESOLVE][t+Ns]` lines. Look for peak Deno PSS and cgroup current.
+
+**Scenario C (1 VC + advance):** Play one song to completion, let it advance naturally to a second song. The `advance()` path means old FFmpeg is alive during the full 25s resolve window. This is the most important scenario.
+
+**Scenario D (2 VCs + resolver):** Two groups each playing; one advances while the other continues. Collect cgroup current during the overlap.
+
+**Critical questions this deployment answers:**
+- What is cgroup `memory.current` at the Deno peak? (confirms or refutes 512 MB breach)
+- What is PSS (not RSS) for Python + yt-dlp + Deno + FFmpeg?
+- Does Deno peak continue rising after t+20s? (1s polling will show this)
+- Does the 1-VC advance() transition push cgroup above 512 MB?
+
+---
+
+#### Remaining uncertainty after this deployment
+
+- Actual production measurements not yet collected (this entry records the instrumentation)
+- PSS correction factor will be known after Scenario B runs
+- True Deno peak will be known after 1s polling captures the t+20–25s window
+- Whether 512 MB is breached during Scenario C remains UNKNOWN until measurement

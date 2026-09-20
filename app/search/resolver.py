@@ -224,7 +224,7 @@ class StreamResolver:
             # [MEM DIAGNOSTIC] Start background polling task to capture peak during Deno JIT
             _stop_poll = asyncio.Event()
             _poll_task = asyncio.create_task(
-                poll_memory_during("DURING_RESOLVE", interval_sec=5.0, stop_event=_stop_poll)
+                poll_memory_during("DURING_RESOLVE", interval_sec=1.0, stop_event=_stop_poll)
             )
             try:
                 url = await asyncio.wait_for(

@@ -147,9 +147,10 @@ class ApplicationLifecycle:
         # This tells us: (a) how much RAM the bot uses before any /play,
         # (b) whether the pre-warm populated the Deno gen/ cache,
         # (c) whether v8_code_cache_v* exists (warm Deno) or not (cold Deno).
-        from app.infrastructure.memprobe import log_deno_cache, log_memory
+        from app.infrastructure.memprobe import log_deno_cache, log_memory, log_cgroup_only
         log_deno_cache("STARTUP")
         log_memory("STARTUP_BASELINE")
+        log_cgroup_only("STARTUP_CGROUP")
 
     async def stop(self) -> None:
         """Shut down all sub-systems in reverse startup order."""
