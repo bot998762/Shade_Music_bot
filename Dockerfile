@@ -117,8 +117,8 @@ USER botuser
 # timeout 60: if the pre-warm takes more than 60 s (e.g. very constrained
 # build environment), fail gracefully rather than hanging the build.
 # The bot still works without the cache — the first resolve is just slower.
-RUN python3 -c "
-import importlib.metadata, pathlib, sys
+RUN set -e; python3 - << 'PREWARM_EOF'
+import importlib.metadata, pathlib, sys, subprocess, os
 try:
     dist = importlib.metadata.distribution('yt-dlp-ejs')
     ejs_path = pathlib.Path(list(dist.files)[0].locate()).resolve()
@@ -126,17 +126,16 @@ try:
 except Exception as e:
     print(f'yt-dlp-ejs not found: {e}', file=sys.stderr)
     sys.exit(0)
-import subprocess, os
 result = subprocess.run(
     ['timeout', '60', '/usr/local/bin/deno', 'run', '--ext=js',
      '--no-prompt', '--no-remote', '--no-local-npm', str(ejs_path)],
-    input=b'',
-    capture_output=True,
+    input=b'', capture_output=True,
     env={**os.environ, 'DENO_NO_UPDATE_CHECK': '1'},
 )
 print(f'pre-warm exit={result.returncode}', file=sys.stderr)
-print(result.stderr.decode(errors=\"replace\")[:500], file=sys.stderr)
-" || true
+print(result.stderr.decode(errors='replace')[:500], file=sys.stderr)
+PREWARM_EOF
+true
 
 # Render injects $PORT at runtime; 8080 is the local development fallback.
 EXPOSE 8080

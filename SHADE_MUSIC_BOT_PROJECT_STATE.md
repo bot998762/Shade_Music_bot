@@ -2134,4 +2134,64 @@ git push origin main
 
 The codebase is correctly prepared. The plan upgrade is configured.
 Production validation is the single remaining step.
+---
+
+### 2026-09-27 — Dockerfile Build Fix: Pre-warm Script Syntax Error
+
+**Date**: 2026-09-27
+**Severity**: Build-blocking — service failed to build on Render.
+
+---
+
+#### Error
+
+```
+Dockerfile:121
+error: failed to solve: dockerfile parse error on line 121: unknown instruction: import
+```
+
+#### Root Cause
+
+The Deno pre-warm `RUN` instruction used `python3 -c "..."` with a literal newline
+immediately after the opening quote:
+
+```dockerfile
+RUN python3 -c "
+import importlib.metadata, pathlib, sys   ← Docker sees "import" as an instruction
+```
+
+Docker parses each line of a `RUN` block after processing shell escapes. The newline
+inside the double-quoted string caused Docker to treat `import` as a new Dockerfile
+instruction keyword.
+
+This bug was introduced when the pre-warm was restored from history. The original
+pre-warm used a similar pattern, but the restoration incorrectly embedded the Python
+source as a multi-line `-c` argument rather than using a heredoc or single-line form.
+
+#### Fix
+
+Replaced the broken `RUN python3 -c "..."` form with a shell heredoc:
+
+```dockerfile
+RUN set -e; python3 - << 'PREWARM_EOF'
+import importlib.metadata, pathlib, sys, subprocess, os
+...
+PREWARM_EOF
+true
+```
+
+The `python3 -` form reads the script from stdin. The heredoc (`<< 'PREWARM_EOF'`)
+provides the script as stdin. Docker passes the entire `RUN` command to `/bin/sh -c`,
+which supports heredoc syntax natively. The `true` at the end ensures the `RUN` step
+always exits 0 (pre-warm failure is non-fatal).
+
+#### Files Changed
+
+| File | Change |
+|---|---|
+| `Dockerfile` | `RUN python3 -c "\n..."` → `RUN set -e; python3 - << 'PREWARM_EOF'\n...\nPREWARM_EOF\ntrue` |
+
+#### Test Suite
+
+117/117 passing. No regressions.
 
