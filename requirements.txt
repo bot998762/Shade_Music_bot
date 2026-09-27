@@ -32,15 +32,46 @@ ntgcalls==2.2.5
 # redeploy is needed to pick up a newer version (Render caches pip installs).
 #
 # Key milestones the floor must clear:
-#   2025.11.12 — JS runtime (Deno) support introduced; yt-dlp-ejs required
+#   2025.11.12 — JS runtime (Deno/Node.js) support for n-sig + PO-token introduced
 #   2026.03.17 — youtube: Always respect webpage_client extractor-arg
 #                (makes our tv_embedded client selection reliable)
-#   2026.07.04 — Latest stable; Deno ≥ v2.3.0 required
+#   2026.07.04 — Latest stable floor
 #
-# The [default] extra installs yt-dlp-ejs — the JavaScript bundle that
-# yt-dlp runs inside Deno to solve YouTube's n-signature and PO-token
-# challenges.  Without it, YouTube extraction falls back to a deprecated
-# limited mode and will eventually stop working entirely.
+# JS runtime: Deno + yt-dlp-ejs (via [default] extra).
+#
+# yt-dlp supports multiple JS runtimes for YouTube n-signature deobfuscation
+# (required for all direct CDN URLs regardless of player client) and PO-token
+# generation (required for mweb/web clients only).  Runtime priority:
+#   Deno (if yt-dlp-ejs installed + deno binary present) — highest priority ← USED
+#   Node.js (if node/nodejs binary present)              — fallback (NOT used)
+#   Python jsinterp (built-in)                           — broken for YouTube 2026+
+#
+# WHY Deno + yt-dlp[default]:
+#   The [default] extra installs yt-dlp-ejs, which yt-dlp runs inside Deno to
+#   solve YouTube n-sig and PO-token challenges.  This is the ONLY confirmed
+#   working path for YouTube n-sig in yt-dlp >= 2025.11.12.
+#
+#   The Node.js alternative was investigated (Sep 2026) and DISPROVEN:
+#   yt-dlp's YouTube extractor uses the [jsc:] framework exclusively for n-sig.
+#   The [jsc:] framework has only a DenoJSI backend — there is no NodeJSI.
+#   Node.js is available to the generic jsinterp (other extractors) but NOT
+#   to YouTube's [jsc:] n-sig path.  Installing nodejs has no effect on YouTube.
+#
+# WHY NOT stay on 512 MB Render Starter:
+#   Production measurement (2026-09-21): Python PSS ≈144 MB + yt-dlp PSS ≈92 MB
+#   + Deno PSS ≈244 MB ≈ 480 MB PSS + ≈32 MB kernel overhead = 512 MB → OOM kill.
+#   The Render plan was upgraded to Standard (2 GB RAM) — Deno now fits with
+#   ≈1.4 GB headroom even during advance() overlap with active FFmpeg.
+#
+# The [default] extra bundles: pycryptodomex, brotli, certifi, requests,
+# urllib3, websockets, and yt-dlp-ejs.  All are beneficial:
+#   pycryptodomex — AES-128/CBC decryption for encrypted streams
+#   brotli        — HTTP brotli content-encoding support
+#   certifi       — SSL certificate bundle
+#   requests      — HTTP library used by yt-dlp
+#   urllib3       — HTTP library companion
+#   websockets    — live stream WebSocket support
+#   yt-dlp-ejs    — Deno JavaScript challenge solver (REQUIRED for YouTube n-sig)
 yt-dlp[default]>=2026.07.04
 
 # ─── Database ──────────────────────────────────────────────────────────────────

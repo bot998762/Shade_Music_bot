@@ -22,7 +22,7 @@ DEFAULT_VOLUME:         int = 100
 
 # ── Timeouts (seconds) ────────────────────────────────────────────────────────
 SEARCH_TIMEOUT_SEC:         int = 20
-STREAM_RESOLVE_TIMEOUT_SEC: int = 90  # DIAGNOSTIC: temporarily increased from 30 to test cold Deno JIT hypothesis
+STREAM_RESOLVE_TIMEOUT_SEC: int = 90  # Kept at 90 s for Render Standard validation; reduce to 30 s after first successful deployment confirms Deno resolution time
 
 # ── Thread executor ───────────────────────────────────────────────────────────
 YT_EXECUTOR_WORKERS:    int = 1

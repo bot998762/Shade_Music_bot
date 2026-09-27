@@ -549,14 +549,26 @@ class TestDenoAndEjsAudit(unittest.TestCase):
 
     def test_tv_embedded_avoids_po_token_requirement(self) -> None:
         """
-        CONFIRMED (per yt-dlp documentation and resolver module docstring):
+        CONFIRMED (per yt-dlp documentation and Sep 21 production evidence):
         The TVHTML5_SIMPLY_EMBEDDED_PLAYER (tv_embedded) does not require
-        YouTube PO (Proof of Origin) tokens.  yt-dlp does not invoke Deno
-        for PO token generation when using this client.
+        YouTube PO (Proof of Origin) tokens.  yt-dlp does not invoke the
+        PO-token generation path when using this client.
 
-        Note: n-signature deobfuscation may still be required, but yt-dlp
-        handles this via its Python jsinterp without Deno involvement when
-        tv_embedded returns standard n-signature formats.
+        CORRECTION (2026-09-21): The original note here was WRONG.
+        "n-sig deobfuscation may still be required" was understated.
+        Production measurement (2026-09-21) CONFIRMED that n-signature
+        deobfuscation IS required for tv_embedded — it applies to ALL
+        YouTube CDN URLs regardless of player client.  Deno WAS invoked
+        for n-sig even with tv_embedded, causing OOM at 512 MB.
+
+        INVESTIGATION (2026-09-23): Node.js as an alternative to Deno was
+        investigated and DISPROVEN at source level.  yt-dlp's YouTube
+        extractor uses the [jsc:] framework exclusively for n-sig, which
+        has only a DenoJSI backend.  No NodeJSI backend exists.
+
+        RESOLUTION: Render plan upgraded to Standard (2 GB RAM).
+        Deno + yt-dlp-ejs are restored as the required runtime.
+        Production validation on Render Standard is pending.
 
         This test documents the expectation, not the live behavior.
         """

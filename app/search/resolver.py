@@ -49,27 +49,42 @@ This explains why:
                      token step, whereas Phase 1's missing selector caused
                      yt-dlp to fail earlier with "format not available".
 
-The fix: tv_embedded client (no Deno, no PO tokens)
-----------------------------------------------------
-YouTube's TVHTML5_SIMPLY_EMBEDDED_PLAYER API (client name: tv_embedded)
-returns stream URLs that do NOT require PO-token validation.  yt-dlp
-recognises this and does not invoke Deno for tv_embedded responses.
+The fix: Render plan upgrade to Standard (2 GB RAM)
+---------------------------------------------------
+Production measurement (2026-09-21) showed that even with tv_embedded
+(which avoids PO tokens), Deno is still invoked for n-signature
+deobfuscation — a step required for ALL YouTube CDN URLs regardless of
+player client.  Deno PSS peaked at ≈244 MB during n-sig execution.
 
-Result: full URL extraction completes in 2–5 s instead of > 30 s.
+Key distinction (previously incorrect in this docstring):
+  PO tokens    — required only for mweb/web clients → tv_embedded skips these
+  n-signature  — required for ALL direct CDN URLs → applies to tv_embedded too
 
-Format coverage with tv_embedded:
-  - Format 140  (m4a audio-only, 128 kbps)   — preferred by bestaudio
-  - Format 251  (opus audio-only, 160 kbps)  — preferred by bestaudio
-  - Format 18   (360p mp4 muxed)             — best fallback
-  - Format 22   (720p mp4 muxed)             — occasional fallback
-  All are usable by FFmpeg → PyTgCalls for audio playback.
+With Deno on 512 MB Render Starter:
+  Python (144) + yt-dlp (92) + Deno (244) ≈ 480 MB PSS
+  + ≈32 MB kernel overhead → cgroup ≈ 512 MB → OOM KILL.
+
+Alternative investigated and DISPROVEN — Node.js as yt-dlp JS runtime:
+  yt-dlp's YouTube extractor uses the [jsc:] framework for n-sig, which has
+  only a DenoJSI backend.  There is no NodeJSI backend in yt-dlp 2026.07.04.
+  Installing nodejs has no effect on YouTube n-sig extraction.
+  See project state 2026-09-23 for the source-level forensic analysis.
+
+Resolution — Render Standard plan (2 GB RAM):
+  Python (≈144 MB PSS) + yt-dlp (≈92 MB PSS) + Deno (≈244 MB PSS)
+  ≈ 480 MB PSS + ≈32 MB overhead ≈ 512 MB → fits in 2 GB with ≈1.5 GB headroom.
+  With active FFmpeg during advance(): ≈562 MB → still ≈1.46 GB headroom.
+  This is the only confirmed working path. Deno + yt-dlp-ejs are restored.
+
+tv_embedded is kept: avoids PO tokens → no PO-token generation overhead,
+typically resolves in 2–5 s once Deno/yt-dlp-ejs are warm.
 
 Concurrency limit
 -----------------
-Each yt-dlp subprocess uses ~80–150 MB peak (no Deno now, so lower than
-before).  The bot base is ~150 MB.  The asyncio.Semaphore(1) gate is kept
-as a memory safety rail for 512 MB Render, even though the memory pressure
-is now lower.
+Semaphore(1) is kept.  Two concurrent resolvers would use:
+  Python (144) + 2×yt-dlp (184) + 2×Deno (488) ≈ 816 MB PSS.
+  Even at 2 GB this is significant. Single-concurrent is the correct gate.
+  The semaphore serialises resolves from ALL chats globally.
 
 Contract
 --------
@@ -77,22 +92,19 @@ Contract
   FAILURE   → None (yt-dlp exited non-zero; caller raises StreamResolveError)
   TIMEOUT   → raises StreamResolveTimeoutError (yt-dlp process killed)
 
-Diagnostic mode (TEMPORARY)
-----------------------------
-_DIAGNOSTIC is True in this build.  When True:
+Diagnostic mode
+---------------
+_DIAGNOSTIC=True is active for the first production validation on Render Standard.
+Set False after confirming Deno extraction works and cgroup measurements are collected.
+When True:
   - ``--verbose`` replaces ``--quiet``/``--no-warnings`` so yt-dlp emits its
-    full internal trace to stderr.
-  - On timeout, after the process group is killed, the resolver drains
-    whatever partial stdout/stderr the subprocess had already written to its
-    pipe buffers and logs it at ERROR level under the [RESOLVE][DIAGNOSTIC]
-    prefix.
+    full internal trace to stderr, including [jsc:deno] n-sig steps.
+  - On timeout, partial stdout/stderr are drained from pipe buffers and
+    logged at ERROR level under the [RESOLVE][DIAGNOSTIC] prefix.
   - The pipe drain has its own 3-second timeout so it can never block the
     event loop or delay cleanup.
   - Process-group kill, process reaping, semaphore release, and the
     no-ghost-process guarantee are all unchanged.
-
-Set _DIAGNOSTIC = False and restore --quiet/--no-warnings to return to
-normal silent operation once the root cause has been identified.
 
 Stage log: [RESOLVE]
 """
@@ -114,21 +126,22 @@ from app.shared.constants import (
 from app.shared.exceptions import StreamResolveTimeoutError
 
 # ── Diagnostic mode ────────────────────────────────────────────────────────────
-# TEMPORARY — set False once the timeout root cause has been identified.
+# Set True to enable verbose yt-dlp tracing for production debugging.
 #
 # When True:
 #   • ``--verbose`` is added to the yt-dlp command in place of
 #     ``--quiet``/``--no-warnings``.  yt-dlp then emits its full internal
-#     trace (HTTP requests, player JS download, n-signature steps, Deno
+#     trace (HTTP requests, player JS download, n-signature steps, [jsc:deno]
 #     invocation, format selection, etc.) to stderr.
 #   • On timeout, the partial stderr (and stdout) that the subprocess wrote
 #     before it was killed are drained from the pipe buffers and logged.
 #   • Extraction behaviour is unchanged — same player client, same format
 #     selector, same timeout, same kill semantics.
 #
-# Must be False in normal production to avoid leaking internal yt-dlp traces
-# in logs and to keep log volume manageable.
-_DIAGNOSTIC: bool = True
+# True during the first Render Standard (2 GB) validation deployment so we
+# can confirm [jsc:deno] is active, measure resolution time, and collect
+# cgroup measurements.  Set False once validation is complete.
+_DIAGNOSTIC: bool = True   # Render Standard validation: confirm Deno+yt-dlp-ejs restored, measure cgroup
 
 # ── Pipe-drain timeout ─────────────────────────────────────────────────────────
 # After killing the subprocess on timeout, we have this many seconds to drain
@@ -153,24 +166,25 @@ _YDL_FORMAT = "bestaudio[acodec!=none]/best[acodec!=none]/best"
 # This is the sole player client.  See module docstring for the full
 # explanation.  Short version:
 #
-#   mweb / web   → require YouTube PO tokens → yt-dlp invokes Deno →
-#                  Deno JIT compilation hangs > 30 s on Render free tier →
-#                  StreamResolveTimeoutError every time.
+#   mweb / web   → require YouTube PO tokens (heavy: invokes external JS runtime)
+#                  AND n-signature deobfuscation.  Avoid.
 #
-#   tv_embedded  → does NOT require PO tokens → Deno never invoked →
-#                  resolves in 2–5 s.
+#   tv_embedded  → does NOT require PO tokens → skips PO-token generation overhead.
+#                  STILL requires n-signature deobfuscation (applies to ALL clients).
+#                  n-sig runs via Deno + yt-dlp-ejs ([jsc:deno] in yt-dlp logs).
+#                  Resolves in 2–5 s when Deno/yt-dlp-ejs V8 cache is warm.
 #
-# DO NOT restore mweb or web here without first confirming that Deno cold-
-# start completes well within STREAM_RESOLVE_TIMEOUT_SEC on the target
-# Render plan.  Pre-warming the Deno cache in the Dockerfile would be
-# necessary for that.
+# DO NOT restore mweb or web without memory budget analysis — they add
+# PO-token generation overhead on top of n-sig, increasing runtime memory.
 _PLAYER_CLIENT = "tv_embedded"
 
 # ── Concurrency gate ───────────────────────────────────────────────────────────
 # Caps simultaneous yt-dlp subprocesses at 1.
-# Peak memory per subprocess: ~80–150 MB (no Deno invocation now).
-# Bot base: ~150 MB.  Two concurrent subprocesses would still risk OOM on
-# a 512 MB instance if other work is also happening.  Keep the gate.
+# Peak memory per subprocess: yt-dlp ≈92 MB PSS + Deno ≈244 MB PSS = ≈336 MB PSS.
+# Bot base ≈144 MB PSS.  Two concurrent subprocesses: 144 + 2×336 = 816 MB PSS.
+# On Render Standard (2 GB), this fits, but leaves only ≈1.2 GB margin.
+# Single-concurrent is still the correct gate: no gain from parallel resolves
+# (queue advances one track at a time) and reduces peak memory pressure.
 _RESOLVE_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(1)
 
 
@@ -282,7 +296,7 @@ class StreamResolver:
         """
         Spawn yt-dlp as a subprocess and return the direct audio URL.
 
-        Uses tv_embedded client — no PO tokens, no Deno, fast completion.
+        Uses tv_embedded client — no PO tokens.  n-sig solved via Deno+yt-dlp-ejs ([jsc:deno]).
 
         start_new_session=True places yt-dlp in its own process group so
         SIGTERM via os.killpg() kills both yt-dlp and any child processes

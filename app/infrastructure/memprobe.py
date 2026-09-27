@@ -319,7 +319,7 @@ async def poll_memory_during(
 
 
 def log_deno_cache(label: str = "STARTUP") -> None:
-    """Check Deno V8 code-cache directory."""
+    """Check Deno V8 code-cache directory and deno binary availability."""
     deno_dir  = os.path.expanduser("~/.cache/deno")
     explicit  = "/home/botuser/.cache/deno"
     lines: List[str] = []

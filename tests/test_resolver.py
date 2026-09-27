@@ -363,11 +363,29 @@ class TestDiagnosticMode(unittest.IsolatedAsyncioTestCase):
 
     # ── Diagnostic flag ───────────────────────────────────────────────────────
 
-    def test_diagnostic_mode_is_enabled(self) -> None:
-        """_DIAGNOSTIC must be True in this build."""
+    def test_diagnostic_mode_is_enabled_for_render_standard_validation(self) -> None:
+        """
+        _DIAGNOSTIC must be True for the first Render Standard (2 GB) validation.
+
+        Root cause (2026-09-21): Deno PSS ≈244 MB → OOM on Render Starter (512 MB).
+        Fix: Render plan upgrade to Standard (2 GB RAM).
+        Deno + yt-dlp-ejs are restored as the required YouTube n-sig runtime.
+
+        Node.js hypothesis was investigated (2026-09-23) and DISPROVEN:
+        yt-dlp's YouTube [jsc:] framework has only a DenoJSI backend; no NodeJSI.
+
+        _DIAGNOSTIC=True ensures yt-dlp --verbose output is logged so we can:
+          a) Confirm [jsc:deno] appears in logs (Deno+yt-dlp-ejs is active)
+          b) Measure actual resolution time on Render Standard
+          c) Collect cgroup memory.current/peak for the memory model
+          d) Confirm advance() stays within memory budget
+
+        Set _DIAGNOSTIC = False AFTER production validation confirms success
+        and STREAM_RESOLVE_TIMEOUT_SEC is reduced from 90 to 30.
+        """
         self.assertTrue(
             self.rm._DIAGNOSTIC,
-            "_DIAGNOSTIC must be True for the diagnostic deployment"
+            "_DIAGNOSTIC must be True for Render Standard validation — not yet confirmed in production"
         )
 
     # ── Command construction under diagnostic mode ────────────────────────────

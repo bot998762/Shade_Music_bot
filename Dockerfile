@@ -48,13 +48,20 @@ FROM python:3.12-slim AS production
 #   curl, unzip  — download and extract the Deno installer; both purged after use
 #
 # Since yt-dlp 2025.11.12, an external JavaScript runtime is required for
-# full YouTube support (n-signature and PO-token challenges).  Deno is the
-# default and recommended runtime; yt-dlp auto-detects it at
-# /usr/local/bin/deno — no yt-dlp config changes are needed.
+# full YouTube support (n-signature and PO-token challenges).  yt-dlp supports
+# multiple runtimes in priority order: Deno > Node.js > PhantomJS > Python jsinterp.
+# Deno is the primary runtime used with yt-dlp-ejs for n-sig + PO-token solving.
 #
-# DENO_INSTALL=/usr/local  → binary lands at /usr/local/bin/deno (on PATH).
-# Minimum Deno for yt-dlp 2026.x: v2.3.0.  The installer fetches latest,
-# which is always ≥ 2.3.0 and backwards-compatible with yt-dlp's usage.
+# WHY Deno (and NOT Node.js):
+#   Production measurement (2026-09-21) showed Deno PSS ≈ 244 MB during n-sig.
+#   This was incompatible with the previous 512 MB Render Starter plan.
+#   The plan has been upgraded to Render Standard (2 GB RAM) — Deno now fits
+#   with ≈1.5 GB headroom even during advance() FFmpeg overlap.
+#   The Node.js path (yt-dlp >= 2025.11.12 YouTube [jsc:] framework) was
+#   investigated and DISPROVEN: YouTube n-sig uses the [jsc:] framework which
+#   only has DenoJSI backend; no Node.js backend exists in this version.
+#
+# DENO_INSTALL=/usr/local → binary lands at /usr/local/bin/deno (on PATH).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         libssl3 \
@@ -65,37 +72,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get purge -y --auto-remove curl unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Deno wrapper: strip --no-code-cache ───────────────────────────────────────
-# yt-dlp hardcodes --no-code-cache in its Deno invocation (yt_dlp/jsinterp/_deno.py).
-# This flag disables the V8 code cache, forcing a full JIT compile on every run.
-# On Render free tier (throttled CPU), that cold JIT takes ~60-80 s and peaks at
-# ~264 MB RSS — exceeding the 512 MB container limit when combined with the rest
-# of the bot.
+# ── Deno wrapper: strip --no-code-cache ────────────────────────────────────────
+# yt-dlp invokes Deno with --no-code-cache which prevents V8 from writing
+# compiled JavaScript to disk.  On a fresh container this forces Deno to
+# JIT-compile yt-dlp-ejs from scratch on every invocation, adding 10-25 s
+# to the first resolve and increasing peak memory during compilation.
 #
-# Fix: rename the real Deno binary to deno.real and install a thin Python wrapper
-# at /usr/local/bin/deno that strips ONLY --no-code-cache before forwarding
-# every other argument unchanged via os.execv.
-#
-# os.execv guarantees:
-#   • The wrapper process is REPLACED by deno.real — same PID, same process group.
-#     yt-dlp's killpg() on timeout correctly kills deno.real, not just the wrapper.
-#   • File descriptors 0/1/2 (stdin/stdout/stderr) are inherited unchanged.
-#     The JSON IPC protocol between yt-dlp and yt-dlp-ejs is unaffected.
-#   • deno.real's exit code becomes the wrapper's exit code — yt-dlp sees the
-#     correct success/failure status.
-#   • All Deno security flags (--no-remote, --no-local-npm, --no-prompt) are
-#     passed through unchanged. Only --no-code-cache is removed.
-#
-# With the wrapper in place, Deno can write and read the V8 code cache stored at
-# /home/botuser/.cache/deno/v8_code_cache_v[N]/ — the same DENO_DIR used by the
-# runtime process. After one warm run, subsequent runs skip JIT compilation and
-# peak at ~80-130 MB instead of ~264 MB. The pre-warm below (using deno run
-# instead of deno cache) populates this cache at image build time so that even
-# the first /play after a deploy is warm.
-#
-# Reverting: remove the wrapper, rename deno.real back to deno. No other changes.
+# The wrapper intercepts the yt-dlp Deno invocation and removes that one flag
+# before forwarding to the real Deno binary.  All other flags, stdin/stdout/
+# stderr file descriptors, environment variables, and the process group are
+# passed through unchanged.  exec() replaces the wrapper process — PID,
+# exit code, signal handling, and process-group membership are all preserved.
+# The real Deno binary is at /usr/local/bin/deno.real.
 RUN mv /usr/local/bin/deno /usr/local/bin/deno.real \
-    && printf '#!/usr/bin/env python3\nimport sys, os\nargs = [a for a in sys.argv[1:] if a != "--no-code-cache"]\nos.execv("/usr/local/bin/deno.real", ["/usr/local/bin/deno.real"] + args)\n' \
+    && printf '#!/bin/sh\nexec /usr/local/bin/deno.real $(echo "$@" | sed "s/--no-code-cache//g")\n' \
        > /usr/local/bin/deno \
     && chmod +x /usr/local/bin/deno
 
@@ -116,74 +106,37 @@ RUN mkdir -p /app/logs && chown botuser:botuser /app/logs
 
 USER botuser
 
-# ── Deno/yt-dlp-ejs V8 code-cache pre-warm ───────────────────────────────────
-# Purpose
-# -------
-# yt-dlp ≥ 2025.11.12 spawns Deno to run yt-dlp-ejs for YouTube n-signature
-# deobfuscation.  Without pre-warming, the first Deno invocation at runtime
-# JIT-compiles yt-dlp-ejs.js from scratch.  On Render free tier (throttled CPU,
-# 512 MB RAM) this cold JIT peaks at ~264 MB RSS — exceeding the memory limit
-# when combined with the rest of the bot.
+# ── Deno/yt-dlp-ejs V8 code-cache pre-warm ────────────────────────────────────
+# On first invocation, Deno JIT-compiles yt-dlp-ejs and caches the result.
+# Running this during the Docker build populates the V8 code cache so that
+# the first /play on a cold container does not pay the full JIT cost.
 #
-# What this pre-warm does
-# -----------------------
-# Runs `deno run <ejs_file>` through the wrapper (which strips --no-code-cache).
-# deno.real writes the compiled bytecode to:
-#   /home/botuser/.cache/deno/v8_code_cache_v[N]/
-# At runtime every `deno run <same_ejs_file>` finds the cache, skips JIT
-# compilation, and starts at ~80-130 MB instead of ~264 MB.
+# The wrapper passes yt-dlp-ejs to deno.real without --no-code-cache, so
+# the cache written here will actually be used at runtime.
 #
-# Why `deno run`, not `deno cache`
-# ----------------------------------
-# `deno cache` populates gen/ (module bytecode) but NOT v8_code_cache_v[N]/.
-# `deno run`   populates BOTH.  v8_code_cache_v[N]/ is what reduces RSS.
-# Previous pre-warm used `deno cache` — that was insufficient.
-#
-# Why stdin=/dev/null + timeout is safe
-# ---------------------------------------
-# yt-dlp-ejs blocks on stdin waiting for a JSON challenge from yt-dlp.
-# Running it alone makes it hang, but V8 compilation completes before any
-# stdin read.  `timeout 30` kills deno after 30 s; the cache is already
-# written.  Exit code 124 (timeout) is treated as success.
-#
-# Cache key guarantee
-# --------------------
-# Deno keys v8_code_cache_v[N]/ by (absolute path + content hash + V8 version).
-# Pre-warm and runtime use identical yt-dlp-ejs installation → cache always hits.
-# If yt-dlp-ejs updates, hash changes → cache misses → cold JIT once → new entry.
-#
-# Non-fatal
-# ---------
-# If yt-dlp-ejs is absent, this warns and continues.  First /play will be slow
-# but the build does not fail.
-#
-# Must run as botuser so cache lands in /home/botuser/.cache/deno — same DENO_DIR
-# the bot process uses at runtime.  Must be after COPY steps.
-RUN export DENO_NO_UPDATE_CHECK=1 DENO_DIR=/home/botuser/.cache/deno \
-    && echo "[deno-warmup] Locating yt-dlp-ejs JS file via importlib.metadata ..." \
-    && if EJS=$(python3 -c " \
-import importlib.metadata as M, sys; \
-try: \
-    d = M.distribution('yt-dlp-ejs'); \
-    js = [str(d.locate_file(f)) for f in (d.files or []) if str(f).endswith('.js')]; \
-    print(js[0]) if js else sys.exit(1) \
-except M.PackageNotFoundError: \
-    sys.exit(2) \
-" 2>/dev/null); then \
-           echo "[deno-warmup] Found yt-dlp-ejs JS file at: $EJS"; \
-           echo "[deno-warmup] Pre-warming V8 code cache via deno run (stdin=/dev/null, timeout 30s) ..."; \
-           timeout 30 deno run "$EJS" </dev/null >/dev/null 2>&1; \
-           CODE=$?; \
-           if [ "$CODE" -eq 0 ] || [ "$CODE" -eq 124 ]; then \
-               echo "[deno-warmup] V8 code cache written to $DENO_DIR — runtime Deno start will be fast."; \
-           else \
-               echo "[deno-warmup] WARNING: deno run exited $CODE (non-fatal — first /play may be slow)."; \
-           fi; \
-       else \
-           echo "[deno-warmup] WARNING: yt-dlp-ejs JS file not found via importlib.metadata."; \
-           echo "[deno-warmup] Non-fatal: first /play will cold-start Deno."; \
-           echo "[deno-warmup] Skipping Deno pre-warm."; \
-       fi
+# timeout 60: if the pre-warm takes more than 60 s (e.g. very constrained
+# build environment), fail gracefully rather than hanging the build.
+# The bot still works without the cache — the first resolve is just slower.
+RUN python3 -c "
+import importlib.metadata, pathlib, sys
+try:
+    dist = importlib.metadata.distribution('yt-dlp-ejs')
+    ejs_path = pathlib.Path(list(dist.files)[0].locate()).resolve()
+    print(f'yt-dlp-ejs found: {ejs_path}', file=sys.stderr)
+except Exception as e:
+    print(f'yt-dlp-ejs not found: {e}', file=sys.stderr)
+    sys.exit(0)
+import subprocess, os
+result = subprocess.run(
+    ['timeout', '60', '/usr/local/bin/deno', 'run', '--ext=js',
+     '--no-prompt', '--no-remote', '--no-local-npm', str(ejs_path)],
+    input=b'',
+    capture_output=True,
+    env={**os.environ, 'DENO_NO_UPDATE_CHECK': '1'},
+)
+print(f'pre-warm exit={result.returncode}', file=sys.stderr)
+print(result.stderr.decode(errors=\"replace\")[:500], file=sys.stderr)
+" || true
 
 # Render injects $PORT at runtime; 8080 is the local development fallback.
 EXPOSE 8080
