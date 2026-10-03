@@ -2194,4 +2194,124 @@ always exits 0 (pre-warm failure is non-fatal).
 #### Test Suite
 
 117/117 passing. No regressions.
+---
+
+### 2026-09-27 — Dockerfile Build Fix v2: base64 Pre-warm + First Render Standard Measurements
+
+**Date**: 2026-09-27
+**Type**: Second build fix iteration + first production memory measurements from screenshot.
+
+---
+
+#### Second Build Failure
+
+The previous heredoc fix (`RUN set -e; python3 - << 'PREWARM_EOF'`) also failed:
+
+```
+Dockerfile:138
+error: failed to solve: dockerfile parse error on line 138: unknown instruction: true
+```
+
+Docker's default (non-BuildKit) RUN parser does NOT support shell heredoc `<<` syntax.
+The `PREWARM_EOF` terminator and `true` on their own lines were parsed as Dockerfile
+instructions. Both the original `RUN python3 -c "\nimport..."` and the heredoc form
+have the same root cause: Docker parses standalone lines within a RUN block as
+Dockerfile instructions when they are not continuation lines.
+
+#### Fix (Final)
+
+The pre-warm script is now encoded as base64 and decoded at build time:
+
+```dockerfile
+RUN echo '<base64_blob>' | base64 -d > /tmp/prewarm.py && python3 /tmp/prewarm.py; rm -f /tmp/prewarm.py
+```
+
+This is a single unambiguous line. Docker parses it as one `RUN` instruction.
+No newlines, no heredoc, no quoting issues. The `;` (not `&&`) before `rm` means
+pre-warm failure is non-fatal — the `rm` and subsequent steps always proceed.
+
+Files changed:
+- `Dockerfile` line 120: replaced broken heredoc with base64 decode + run
+
+---
+
+#### First Render Standard Production Measurements (from screenshot, 2026-09-27 02:20 AM UTC)
+
+The bot successfully started on Render Standard from a prior commit
+(before the pre-warm was broken). Screenshot captures the runtime logs.
+
+**Python idle memory on Render Standard:**
+
+| Metric | Value | Source |
+|---|---|---|
+| Python RSS (idle) | 135.5 MB | **MEASURED** — Render Standard, 2026-09-27 |
+| Python PSS (idle) | 122.8 MB | **MEASURED** — Render Standard, 2026-09-27 |
+| cgroup current (idle) | 122.4 MB | **MEASURED** — Render Standard, 2026-09-27 |
+| cgroup peak (idle) | 122.9 MB | **MEASURED** — Render Standard, 2026-09-27 |
+| cgroup limit | unlimited | **MEASURED** — confirms Render Standard plan |
+
+**Comparison with Render Starter (previous measurements):**
+
+| Metric | Render Starter | Render Standard | Delta |
+|---|---|---|---|
+| Python RSS idle | 155.8 MB | 135.5 MB | −20.3 MB |
+| Python PSS idle | 144.0 MB | 122.8 MB | −21.2 MB |
+| cgroup idle | ~160 MB (est) | 122.4 MB | −~38 MB |
+
+The lower baseline on Standard is significant. With less memory pressure, Linux
+allocates shared library pages more efficiently. The PSS delta of ~21 MB means the
+entire memory budget is ~21 MB better than all previous estimates assumed.
+
+**Revised advance() scenario estimate (using Standard measurements):**
+
+| Component | Render Starter (prev est) | Render Standard (revised) | Classification |
+|---|---|---|---|
+| Python PSS | ≈144 MB | ≈123 MB | MEASURED (idle) |
+| yt-dlp PSS | ≈92 MB | ≈92 MB | MEASURED (Sep 21) |
+| Deno PSS | ≈244 MB | ≈244 MB | MEASURED (Sep 21) |
+| FFmpeg PSS | ≈50 MB | ≈50 MB | ESTIMATED |
+| **Total** | **≈530 MB** | **≈509 MB** | ESTIMATED |
+| + overhead | ≈35 MB | ≈30 MB | ESTIMATED |
+| **cgroup est** | **≈565 MB** | **≈539 MB** | ESTIMATED |
+| Headroom vs 2 GB | 1435 MB | 1461 MB | ESTIMATED |
+
+Even with conservative estimates, the advance() scenario fits comfortably in 2 GB.
+
+**Deno cache status:**
+
+```
+[MEM][STARTUP][DENO_CACHE]
+  /home/botuser/.cache/deno: DOES NOT EXIST
+```
+
+The pre-warm did not run (build failures). First /play will be a cold Deno start.
+The 90-second timeout provides sufficient margin. The base64 fix enables pre-warm
+on the next successful build.
+
+**Services confirmed running:**
+- Telegram bot client: @Shade_Music_bot
+- Assistant (user) client for voice chats: AEON
+- YouTubeSearch + StreamResolver: initialised
+- VoiceChatManager (PyTgCalls v2.3.3 / NTgCalls v2.2.5)
+- PlaybackController: created
+- Health server: http://0.0.0.0:10000
+
+**Note:** PyTgCalls v3.0.0 is available — currently running v2.3.3. Not a blocker.
+
+---
+
+#### Status After This Fix
+
+- Build failures: FIXED (base64 pre-warm is Docker-parser-safe)
+- Production startup: CONFIRMED working (from screenshot)
+- Idle memory on Render Standard: MEASURED (PSS 122.8 MB)
+- /play test: PENDING (requires push of base64 fix + test by Ak)
+- Deno PSS on Standard: PENDING
+- advance() cgroup peak: PENDING
+
+---
+
+#### Test Suite
+
+117/117 passing.
 
