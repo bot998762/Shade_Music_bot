@@ -81,7 +81,7 @@ from app.infrastructure.logger import logger
 from app.shared.exceptions import PrivateGroupError
 from app.streaming.media import AUDIO_QUALITY, IGNORE_VIDEO
 
-StreamEndCallback = Callable[[int], Awaitable[None]]
+StreamEndCallback = Callable[[int, str], Awaitable[None]]   # (chat_id, reason)
 
 # ── Exception message patterns ─────────────────────────────────────────────────
 # Stable across py-tgcalls 2.x versions.
@@ -502,7 +502,7 @@ class VoiceChatManager:
 
             logger.info("[VOICE] Stream ended naturally  chat_id={}", chat_id)
             self._active.discard(chat_id)
-            await self._fire_stream_end(chat_id)
+            await self._fire_stream_end(chat_id, "stream_ended")
 
         # ── 2: VC closed by admin ──────────────────────────────────────────
         @self._tgcalls.on_update(
@@ -514,7 +514,7 @@ class VoiceChatManager:
             was_active = chat_id in self._active
             self._active.discard(chat_id)
             if not self.is_skip_in_progress(chat_id) and was_active:
-                await self._fire_stream_end(chat_id)
+                await self._fire_stream_end(chat_id, "vc_closed")
 
         # ── 3: Bot kicked from group ───────────────────────────────────────
         @self._tgcalls.on_update(
@@ -526,18 +526,24 @@ class VoiceChatManager:
             was_active = chat_id in self._active
             self._active.discard(chat_id)
             if not self.is_skip_in_progress(chat_id) and was_active:
-                await self._fire_stream_end(chat_id)
+                await self._fire_stream_end(chat_id, "kicked")
 
         logger.debug(
             "[VOICE] Handlers registered: "
             "StreamAudioEnded + CLOSED_VOICE_CHAT + KICKED"
         )
 
-    async def _fire_stream_end(self, chat_id: int) -> None:
-        """Safely invoke the registered on_stream_end callback."""
+    async def _fire_stream_end(self, chat_id: int, reason: str = "stream_ended") -> None:
+        """
+        Safely invoke the registered on_stream_end callback.
+
+        reason is one of "stream_ended" | "vc_closed" | "kicked".  The
+        py-tgcalls event itself carries no track identity; the reason only lets
+        the controller apply its stale-event guard to natural ends.
+        """
         if self._on_stream_end is not None:
             try:
-                await self._on_stream_end(chat_id)
+                await self._on_stream_end(chat_id, reason)
             except Exception as exc:
                 logger.error(
                     "[VOICE] _fire_stream_end callback raised  "

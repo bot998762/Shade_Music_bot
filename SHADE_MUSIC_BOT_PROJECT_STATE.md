@@ -2315,3 +2315,35 @@ on the next successful build.
 
 117/117 passing.
 
+
+
+---
+
+### 2026-11-11 — Music features Phase 1 (APPROVED by the user; IMPLEMENTED LOCALLY, NOT committed, NOT pushed, NOT deployed)
+
+Local branch `phase1-playback-controls`, created from `main` at `d82b9d1` (same commit as `origin/main`; 0 commits ahead). All changes are uncommitted working-tree changes. The approved review patch is `phase1_review.patch` (sha256 prefix `be0daec7d53bbb83`); this entry's wording was finalised after that patch and only changes this documentation file. Scope: queue cap, generation tokens, shared advancement, `/skip /stop /end /leave /queue /nowplaying`. Hosting, environment and production were not touched; no dependency was upgraded. The two unpublished diagnostic branches were not touched.
+
+**Final implemented behaviour**
+- **Queue cap:** at most 10 UPCOMING tracks per chat; the current track is separate (1 playing + 10 upcoming). The 11th upcoming `/play` is rejected with a message; nothing is removed silently. The cap is enforced atomically by `SessionManager.enqueue_if_room`, clamped to 1..10 in the controller constructor and in the `Settings.max_queue_size` validator (an override can lower the cap, never raise it). While a chat is idle the first track is started directly and never enters the queue.
+- **Generation tokens:** per-chat counter bumped by every teardown; in-flight start/advance operations re-check it after each await that could install a stream and discard stale work.
+- **Shared advancement:** natural end and `/skip` use one `_advance()` path with a per-chat advance epoch read before waiting for the lock, so a natural end racing `/skip`, or two simultaneous `/skip` presses, advance exactly one track.
+- **`/stop` (`/end`, `/leave` are the same handler):** bumps the generation first, cancels in-flight stream resolution (the resolver kills the yt-dlp process group), waits for the transition lock, then runs the existing CleanupService teardown (leave voice chat, clear queue, state IDLE). It never queues behind a long resolve; a stream being installed is torn down after its install returns.
+- **Lock order:** play lock, then (released) per-chat transition lock (`_advance_locks`), then the SessionManager lock innermost. Telegram message I/O happens outside the transition lock.
+- **Stale stream-end events (mitigated, not eliminated):** the py-tgcalls handlers use only `update.chat_id`; no track/stream identity is used (whether 2.3.3 exposes more is UNKNOWN: package not installable here, official source not reachable). The end reason (`stream_ended` / `vc_closed` / `kicked`) is relayed voice manager → monitor → controller. A `stream_ended` event arriving within `STALE_END_WINDOW_SEC` = 3 s of the current stream being installed (capped at half of a short track) is ignored (`SkipOutcome.STALE`). `vc_closed` and `kicked` are never filtered.
+- **Failed idle start:** a resolver failure/timeout on the first track with tracks queued behind it starts the next queued track through the normal advance path (the requester still receives the error); with nothing queued the session is torn down. A voice join failure or private group tears the session down (queued tracks cannot play) and the chat is told how many queued tracks were dropped. Three consecutive failures end the session (same policy as `/skip`).
+- **`/pause` and `/resume`: NOT implemented.** The `pause_stream`/`resume_stream` names for py-tgcalls 2.3.3 are UNKNOWN (package not installable here; the only page naming them is a third-party library's migration table with no version). `VoiceChatManager.pause/resume` and `PlaybackStatus.PAUSED` are unchanged.
+
+**Files changed (11 modified, 2 new)**
+`app/shared/constants.py` (cap 10, hard ceiling, clamp, stale window), `app/infrastructure/config.py` (validator), `app/shared/exceptions.py` (`PlaybackCancelledError`), `app/shared/errors.py` (messages), `app/playback/controller.py` (generations, epoch, `skip/stop/snapshot`, `_advance`, stale guard, failed-start handling), `app/streaming/voice.py` and `app/playback/monitor.py` (relay the end reason), `app/handlers/play.py` (handles `PlaybackCancelledError`), `app/bootstrap/startup.py` (registers handlers), `tests/test_queue_lifecycle.py` (+19 lines, injected clock in test helpers, no assertion changed), this file (appended); new: `app/handlers/controls.py`, `tests/test_phase1_controls.py` (45 tests).
+
+**Tests (all I/O MOCKED: Telegram, yt-dlp, PyTgCalls, resolver)**
+`python3.12 -m unittest discover -s tests -t .` → 162 run, 162 OK, 0 failed, 1 skipped (the `Settings` validator test; pydantic-settings is not installed here). Same on Python 3.13 and in reverse module order. Baseline before Phase 1: 117/117, all still passing. Deliberate breakages (no duplicate suppression, no stale-install check, stop not cancelling resolution, no cap clamp, stale guard off or applied to VC-closed, teardown on every resolver failure, no dropped-track notice) were each caught. A ResourceWarning from pre-existing `memprobe.py` appears in output. NOT TESTED: real Telegram, real voice chat, real py-tgcalls behaviour, any production run.
+
+**Known limitations / residual risks**
+- No permission checks on the new commands until DJ mode (Phase 6): any group member can `/skip` or `/stop`.
+- Stale-end heuristic: an old stream's end event delivered later than 3 s after the new stream was installed still advances the new track; a genuine end within 3 s of start (a stream that dies instantly) is ignored and needs `/skip`; an ignored stale event leaves `VoiceChatManager._active` cleared for that chat until the next stream replacement, and that flag gates the VC-closed/kicked relays.
+- If the voice chat closes while tracks are queued, `advance` still tries the next track and may end the session after 3 failures (pre-existing; planned for Phase 5).
+- A small amount of per-chat state (generation, epoch, locks) is never freed (same pattern as the existing lock dictionaries).
+- The unpublished `stage0-memory-diagnostics` and `query-log-redaction` branches will conflict with this work in `controller.py` and `youtube.py` when merged.
+
+**Remaining work:** Phases 2–8 (queue operations, inline buttons, loop/volume/seek, voice lifecycle recovery, DJ mode, search/history, full regression) — not started.

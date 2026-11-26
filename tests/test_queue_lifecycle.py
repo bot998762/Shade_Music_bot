@@ -105,6 +105,12 @@ def _make_track(title: str = "Track", url: str = "https://youtube.com/watch?v=te
     )
 
 
+def _advancing_clock():
+    """A clock on which 1000 s pass between consecutive reads (see _make_controller)."""
+    ticks = iter(range(0, 10**9, 1000))
+    return lambda: float(next(ticks))
+
+
 def _make_controller(
     resolver_returns=None,   # str URL or None
     resolver_raises=None,    # exception class/instance or None
@@ -163,6 +169,14 @@ def _make_controller(
             notify=None,
             max_queue=max_queue,
         )
+        ctrl._clock = _advancing_clock()   # see _make_controller
+
+    # These tests model "the track ended" right after it started.  The
+    # controller ignores a stream-end event that arrives within moments of a
+    # stream being installed (stale-event guard), so give it a clock on which
+    # time passes between calls.  Stale-event behaviour has its own tests in
+    # tests/test_phase1_controls.py.
+    ctrl._clock = _advancing_clock()
 
     # Attach mocks for assertion access
     ctrl._mock_resolver = mock_resolver
@@ -437,6 +451,7 @@ class TestControllerQueueLifecycle(unittest.IsolatedAsyncioTestCase):
             session=session, state=state, cleanup=cleanup,
             notify=None, max_queue=50,
         )
+        ctrl._clock = _advancing_clock()   # see _make_controller
 
         with patch("app.playback.controller.FFmpegStreamBuilder.build_from_url",
                    return_value=fake_stream):
@@ -493,6 +508,7 @@ class TestControllerQueueLifecycle(unittest.IsolatedAsyncioTestCase):
             session=session, state=state, cleanup=cleanup,
             notify=None, max_queue=50,
         )
+        ctrl._clock = _advancing_clock()   # see _make_controller
 
         with patch("app.playback.controller.FFmpegStreamBuilder.build_from_url",
                    return_value=fake_stream):
@@ -552,6 +568,7 @@ class TestControllerQueueLifecycle(unittest.IsolatedAsyncioTestCase):
             session=session, state=state, cleanup=cleanup,
             notify=None, max_queue=50,
         )
+        ctrl._clock = _advancing_clock()   # see _make_controller
 
         with patch("app.playback.controller.FFmpegStreamBuilder.build_from_url",
                    return_value=fake_stream):
@@ -609,6 +626,7 @@ class TestControllerQueueLifecycle(unittest.IsolatedAsyncioTestCase):
             session=session, state=state, cleanup=cleanup,
             notify=None, max_queue=50,
         )
+        ctrl._clock = _advancing_clock()   # see _make_controller
 
         play1_done = asyncio.Event()
 
@@ -730,6 +748,7 @@ class TestAdvanceConcurrency(unittest.IsolatedAsyncioTestCase):
             session=session, state=state, cleanup=cleanup,
             notify=None, max_queue=50,
         )
+        ctrl._clock = _advancing_clock()   # see _make_controller
 
         with patch("app.playback.controller.FFmpegStreamBuilder.build_from_url",
                    return_value=fake_stream):

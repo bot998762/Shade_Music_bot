@@ -57,7 +57,7 @@ class StreamMonitor:
         # this module's import footprint minimal and its role unambiguous.
         self._controller = controller
 
-    async def on_stream_end(self, chat_id: int) -> None:
+    async def on_stream_end(self, chat_id: int, reason: str = "stream_ended") -> None:
         """
         Receive a stream-end event and delegate to PlaybackController.
 
@@ -68,5 +68,8 @@ class StreamMonitor:
 
         Stage log: [MONITOR]
         """
-        logger.info("[MONITOR] Stream ended — delegating to controller  chat_id={}", chat_id)
-        await self._controller.advance(chat_id)
+        logger.info(
+            "[MONITOR] Stream ended — delegating to controller  chat_id={}  reason={}",
+            chat_id, reason,
+        )
+        await self._controller.advance(chat_id, reason)

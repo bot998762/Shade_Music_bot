@@ -50,6 +50,7 @@ from app.shared.errors import (
     ADDED_TO_QUEUE,
     LOADING_URL,
     NOW_PLAYING,
+    PLAY_CANCELLED,
     PLAY_NO_QUERY,
     PLAY_NO_RESULTS,
     PLAY_NO_VOICE_CHAT,
@@ -64,6 +65,7 @@ from app.shared.errors import (
 )
 from app.shared.exceptions import (
     NoResultsError,
+    PlaybackCancelledError,
     PrivateGroupError,
     QueueFullError,
     StreamResolveError,
@@ -164,6 +166,10 @@ def register(client: Client, controller: PlaybackController) -> None:
             return
         except QueueFullError as exc:
             await interim.edit_text(str(exc))
+            return
+        except PlaybackCancelledError:
+            # /stop arrived before the stream could be installed.
+            await interim.edit_text(PLAY_CANCELLED)
             return
         except StreamResolveTimeoutError:
             # Resolver timed out — yt-dlp subprocess was killed cleanly.

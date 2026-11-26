@@ -74,6 +74,25 @@ ADDED_TO_QUEUE = (
     "Requested by: {requested_by}"
 )
 
+PLAY_CANCELLED = "⏹ Playback was stopped before it could start."
+
+# ── Playback controls (/skip /stop /end /leave /queue /nowplaying) ────────────
+NOTHING_PLAYING   = "ℹ️ Nothing is playing right now."
+SKIP_DONE         = "⏭ Skipped."
+SKIP_QUEUE_ENDED = "⏭ Skipped. The queue is empty, so playback has ended."
+SKIP_DUPLICATE    = "ℹ️ Already moved on to the next track."
+SKIP_FAILED       = "❌ Could not play the next track. Playback has ended."
+STOP_DONE         = "⏹ Stopped. The queue was cleared and the assistant left the voice chat."
+QUEUE_EMPTY       = "📭 The queue is empty."
+QUEUE_HEADER      = "📜 **Up next** ({count}/{cap})"
+NOW_PLAYING_LINE  = (
+    "🎵 **Now Playing**\n\n"
+    "**{title}**\n"
+    "⏱ {duration}  •  👤 {uploader}\n"
+    "Requested by: {requested_by}\n"
+    "Up next: {upcoming}/{cap}"
+)
+
 # ── General ───────────────────────────────────────────────────────────────────
 SEARCHING    = "🔍 Searching for **{query}**…"
 LOADING_URL  = "⏳ Loading URL…"

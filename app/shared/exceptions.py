@@ -93,6 +93,13 @@ class QueueFullError(ShadeBotError):
     """Raised when a chat's queue has reached its size limit."""
 
 
+class PlaybackCancelledError(ShadeBotError):
+    """
+    Raised when an in-flight start was superseded by /stop (or another
+    session teardown) before a stream could be installed.  Nothing is playing.
+    """
+
+
 # ── Input validation ──────────────────────────────────────────────────────────
 
 class ValidationError(ShadeBotError):

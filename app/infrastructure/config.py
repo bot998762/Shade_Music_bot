@@ -23,6 +23,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.shared.constants import (
     DEFAULT_MAX_QUEUE_SIZE,
+    clamp_queue_cap,
     DEFAULT_VOLUME,
 )
 
@@ -116,6 +117,17 @@ class Settings(BaseSettings):
         if isinstance(v, list):
             return [int(uid) for uid in v if uid]
         return []
+
+    @field_validator("max_queue_size", mode="before")
+    @classmethod
+    def clamp_max_queue(cls, v: object) -> int:
+        """
+        Limit MAX_QUEUE_SIZE to 1..MAX_UPCOMING_HARD_CAP (10).
+
+        An override can lower the cap but never raise it.  Clamped rather than
+        rejected so an old, larger value in the environment cannot stop startup.
+        """
+        return clamp_queue_cap(v)  # type: ignore[arg-type]
 
     @field_validator("default_volume", mode="before")
     @classmethod

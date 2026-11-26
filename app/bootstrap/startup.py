@@ -312,6 +312,7 @@ def init_handlers(
     logger.info("[STARTUP] Registering command handlers...")
 
     # Import here to avoid any accidental early import of handler modules
+    from app.handlers import controls as controls_handler
     from app.handlers import help as help_handler
     from app.handlers import play as play_handler
     from app.handlers import start as start_handler
@@ -320,5 +321,6 @@ def init_handlers(
     start_handler.register(bot_client, db)
     help_handler.register(bot_client)
     play_handler.register(bot_client, controller)
+    controls_handler.register(bot_client, controller)
 
-    logger.info("[STARTUP] Handlers registered: /start /help /play")
+    logger.info("[STARTUP] Handlers registered: /start /help /play /skip /stop /end /leave /queue /nowplaying")

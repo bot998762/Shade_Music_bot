@@ -57,18 +57,38 @@ _play_lock (per-chat)
     "idle → start now" has been made, without waiting for yt-dlp or
     the VC join to complete.
 
-_advance_lock (per-chat)
-    Guards advance() to prevent double-advancement when two stream-end
-    events fire for the same chat (e.g. CLOSED_VOICE_CHAT + StreamAudioEnded
-    arriving in close succession).
-    Held for the duration of the full advance() loop, which includes
-    stream resolution.  This is intentional: a second advance() call
-    in the same chat must wait until the first has resolved the next track
-    and called replace_stream(), so that only one track is ever playing.
+_advance_lock / transition lock (per-chat)
+    Serialises every operation that installs or tears down a stream:
+    idle-start (_start_now), advancement (natural end AND /skip, via
+    _advance) and /stop.  Held across stream resolution and the voice
+    replace/join on purpose, so only one stream transition per chat runs
+    at a time.  It is NEVER held across Telegram message I/O (the Now
+    Playing notification is sent after release).
+
+Lock ordering (outer → inner, never reversed):
+    _play_lock  →  (released)  →  transition lock  →  SessionManager lock
+    The SessionManager lock is innermost and only guards in-memory queue
+    operations.  stop() deliberately does NOT take the transition lock
+    before invalidating: it bumps the generation and cancels the in-flight
+    resolution first, then waits for the lock, so it never queues behind a
+    90 s resolve.
+
+Generation token (per chat)
+    Bumped by every teardown (/stop, queue exhausted, failures).  Each
+    operation remembers the generation it started under and re-checks it
+    after every await that could install a stream (resolve, join, replace).
+    A mismatch means the session was stopped or superseded: the stale
+    stream is discarded and state/queue are left alone.
+
+Advance epoch (per chat)
+    Read BEFORE waiting for the transition lock; incremented when an
+    advancement completes.  A call that finds a changed epoch after getting
+    the lock is a duplicate (natural end racing /skip, or two simultaneous
+    /skip presses) and does nothing, so a track can never be advanced twice.
 
 advance() workflow  (called by StreamMonitor on stream-end)
 -----------------------------------------------------------
-1. [ADVANCE]   Acquire per-chat advance lock (prevents double-advance)
+1. [ADVANCE]   Acquire per-chat transition lock; drop if duplicate/stale
 2. [ADVANCE]   Queue empty? → cleanup → IDLE
 3. [ADVANCE]   Dequeue next track
 4. [RESOLVE]   Resolve stream URL
@@ -118,7 +138,10 @@ Stage log: [CONTROLLER]
 from __future__ import annotations
 
 import asyncio
-from typing import Awaitable, Callable, Dict, Optional, Tuple
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
 from app.infrastructure.logger import logger
 from app.playback.cleanup import CleanupService
@@ -127,10 +150,11 @@ from app.playback.state import StateManager
 from app.search.models import Track
 from app.search.resolver import StreamResolver
 from app.search.youtube import YouTubeSearch
-from app.shared.constants import MAX_SKIP_RETRIES
+from app.shared.constants import MAX_SKIP_RETRIES, STALE_END_WINDOW_SEC, clamp_queue_cap
 from app.shared.errors import NOW_PLAYING
 from app.shared.exceptions import (
     NoResultsError,
+    PlaybackCancelledError,
     PrivateGroupError,
     QueueFullError,
     StreamResolveError,
@@ -142,6 +166,36 @@ from app.streaming.ffmpeg import FFmpegStreamBuilder
 from app.streaming.voice import VoiceChatManager
 
 NotifyFn = Callable[[int, str], Awaitable[None]]
+
+
+class SkipOutcome(Enum):
+    """Result of a shared advancement (/skip or natural end)."""
+    SKIPPED         = "skipped"          # next track is now playing
+    QUEUE_ENDED     = "queue_ended"      # queue was empty: session ended
+    FAILED          = "failed"           # consecutive failures: session ended
+    DUPLICATE       = "duplicate"        # another advancement already happened
+    CANCELLED       = "cancelled"        # /stop superseded this operation
+    NOTHING_PLAYING = "nothing_playing"  # chat was idle
+    STALE           = "stale"            # stream-end event too early to be genuine
+
+
+@dataclass(frozen=True)
+class SkipResult:
+    outcome: SkipOutcome
+    track:   Optional[Track] = None
+
+
+@dataclass(frozen=True)
+class PlaybackSnapshot:
+    """Read-only view of one chat for /queue and /nowplaying."""
+    current:  Optional[Track]
+    upcoming: List[Track] = field(default_factory=list)
+    is_idle:  bool        = True
+    cap:      int         = 10
+
+
+class _Superseded(Exception):
+    """Internal: the session generation changed while a stream was resolving."""
 
 
 class PlaybackController:
@@ -160,7 +214,8 @@ class PlaybackController:
     state:        StateManager instance.
     cleanup:      CleanupService instance.
     notify:       Optional async callable — sends "Now Playing" messages.
-    max_queue:    Hard cap on upcoming tracks per chat.
+    max_queue:    Cap on UPCOMING tracks per chat; clamped to 1..10
+                  (the current track is separate and not counted).
     cookies_path: Kept for interface compatibility; not used by resolver.
     """
 
@@ -173,7 +228,7 @@ class PlaybackController:
         state:        StateManager,
         cleanup:      CleanupService,
         notify:       Optional[NotifyFn] = None,
-        max_queue:    int = 50,
+        max_queue:    int = 10,
         cookies_path: Optional[str] = None,
     ) -> None:
         self._search   = search
@@ -183,7 +238,12 @@ class PlaybackController:
         self._state    = state
         self._cleanup  = cleanup
         self._notify   = notify
-        self._max_q    = max_queue
+        self._max_q    = clamp_queue_cap(max_queue)
+        if self._max_q != max_queue:
+            logger.warning(
+                "[CONTROLLER] max_queue={} outside 1..{} — using {}",
+                max_queue, clamp_queue_cap(10**9), self._max_q,
+            )
         self._cookies  = cookies_path
         # One advance lock per chat — prevents concurrent StreamAudioEnded events
         # from double-advancing the queue.
@@ -192,6 +252,44 @@ class PlaybackController:
         # IMPORTANT: this lock is released BEFORE slow I/O (stream resolution,
         # VC join).  It protects only the brief in-memory decision window.
         self._play_locks: Dict[int, asyncio.Lock] = {}
+        # Per-chat session generation: bumped by every teardown (/stop, queue
+        # exhausted, failures).  In-flight operations remember the generation
+        # they started under and abandon their work when it changes.
+        self._gens: Dict[int, int] = {}
+        # Per-chat advance epoch: incremented when an advancement completes;
+        # lets a queued duplicate (natural end + /skip) detect it is redundant.
+        self._epochs: Dict[int, int] = {}
+        # Per-chat in-flight stream-resolution task (cancelled by /stop).
+        self._inflight: Dict[int, "asyncio.Future"] = {}
+        # Per-chat monotonic time at which the CURRENT stream was installed;
+        # used by the stale stream-end guard.  Injectable clock for tests.
+        self._clock = time.monotonic
+        self._started_at: Dict[int, float] = {}
+
+    # ── Generation tokens / lock ownership ────────────────────────────────────
+
+    def generation(self, chat_id: int) -> int:
+        """Current session generation of *chat_id* (starts at 0)."""
+        return self._gens.get(chat_id, 0)
+
+    def _bump_generation(self, chat_id: int) -> int:
+        """Invalidate every in-flight operation of the chat's current session."""
+        self._gens[chat_id] = self._gens.get(chat_id, 0) + 1
+        return self._gens[chat_id]
+
+    def _transition_lock(self, chat_id: int) -> asyncio.Lock:
+        # The per-chat transition lock is the _advance_locks entry (kept under
+        # that name for compatibility).  It serialises every operation that
+        # installs or tears down a stream: idle-start, advance/skip, stop.
+        if chat_id not in self._advance_locks:
+            self._advance_locks[chat_id] = asyncio.Lock()
+        return self._advance_locks[chat_id]
+
+    async def _teardown(self, chat_id: int, reason: str) -> None:
+        """Invalidate the session, then run the shared CleanupService teardown."""
+        self._bump_generation(chat_id)
+        self._started_at.pop(chat_id, None)
+        await self._cleanup.cleanup(chat_id, reason=reason)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -216,7 +314,8 @@ class PlaybackController:
         NoResultsError
             When the search/metadata fetch returns no results.
         QueueFullError
-            When the chat's queue is at its limit.
+            When the chat already has the maximum number of UPCOMING tracks.
+            The currently playing track does not count towards the cap.
         StreamResolveError
             When yt-dlp cannot extract a playable stream URL.
             Show "stream unavailable" — not "no results found".
@@ -225,6 +324,8 @@ class PlaybackController:
             The caller should show a "try again" message.
         VoiceChatError
             When the VC join fails.
+        PlaybackCancelledError
+            When /stop superseded the start before a stream was installed.
         """
         # ── Stage: SEARCH or DIRECT-URL FETCH ────────────────────────
         if is_direct_url(query):
@@ -259,72 +360,210 @@ class PlaybackController:
         # The lock is released BEFORE any I/O so that a second concurrent
         # /play in the same chat can proceed without waiting for yt-dlp or
         # the VC join of the first track.
+        #
+        # Capacity: the queue holds UPCOMING tracks only.  While the chat is
+        # idle the track is handed straight to _start_now() and NEVER enters
+        # the queue, so the first track cannot consume upcoming capacity even
+        # while concurrent /play requests are being accepted.
         if chat_id not in self._play_locks:
             self._play_locks[chat_id] = asyncio.Lock()
 
         async with self._play_locks[chat_id]:
-            added, pos_or_size = await self._session.enqueue_if_room(
-                chat_id, track, self._max_q
-            )
-            if not added:
-                raise QueueFullError(
-                    f"Queue is full ({self._max_q} tracks). "
-                    "Wait for the current track to finish."
+            was_idle = self._state.is_idle(chat_id)
+            gen = self.generation(chat_id)
+            if was_idle:
+                # Mark PLAYING before releasing the play lock so a concurrent
+                # /play cannot also see is_idle=True and race into _start_now().
+                # If _start_now() fails, _teardown() reverts the state to IDLE.
+                self._state.transition_to_playing(chat_id, track)
+                logger.info(
+                    "[CONTROLLER] [START] Idle chat — starting directly  "
+                    "title='{}'  chat_id={}",
+                    track.title, chat_id,
+                )
+            else:
+                added, pos_or_size = await self._session.enqueue_if_room(
+                    chat_id, track, self._max_q
+                )
+                if not added:
+                    raise QueueFullError(
+                        f"Queue is full ({self._max_q} upcoming tracks). "
+                        "Wait for a track to finish or use /skip."
+                    )
+                logger.info(
+                    "[CONTROLLER] [ENQUEUE] title='{}'  chat_id={}  position={}",
+                    track.title, chat_id, pos_or_size,
                 )
 
-            was_idle = self._state.is_idle(chat_id)
-            logger.info(
-                "[CONTROLLER] [ENQUEUE] title='{}'  chat_id={}  "
-                "position={}  was_idle={}",
-                track.title, chat_id, pos_or_size, was_idle,
-            )
-            if was_idle:
-                # Optimistically mark state as PLAYING before releasing the
-                # play lock.  This prevents a concurrent /play call from also
-                # seeing is_idle=True and racing into _start_now().
-                #
-                # We use update_current_track(None) + a direct status write
-                # via transition_to_playing with a placeholder — but the
-                # cleanest path is a dedicated "mark_starting" transition.
-                # Since PlaybackStatus has no STARTING state yet, we
-                # temporarily set the track to avoid breaking state.get().
-                # If _start_now() fails, cleanup() calls transition_to_idle()
-                # which correctly reverts the state.
-                self._state.transition_to_playing(chat_id, track)
-                # Lock is released here; _start_now() runs outside the lock.
-
         if was_idle:
-            try:
-                await self._start_now(chat_id)
-            except Exception:
-                # _start_now already called cleanup() which transitions back
-                # to IDLE — re-raise so the handler can show the error.
-                raise
+            started = await self._start_now(chat_id, gen, track)
+            if not started:
+                raise PlaybackCancelledError("Playback was stopped before it started.")
             return track, True
-        else:
-            return track, False
+        return track, False
 
-    async def advance(self, chat_id: int) -> None:
+    async def advance(self, chat_id: int, reason: str = "stream_ended") -> None:
         """
-        Auto-advance to the next queued track after the current one ends.
+        Stream-end entry point, called by StreamMonitor.
 
-        Called exclusively by StreamMonitor when a stream-end event fires.
+        reason: "stream_ended" (track finished), "vc_closed" or "kicked".
+        Shares ``_advance()`` with /skip, so a natural end and a manual skip
+        arriving together result in exactly one advancement.
 
-        Retry semantics
-        ---------------
-        ``retries`` counts consecutive failures on the current attempt.
-        A successful advance resets it to 0.  This allows a queue of
-        [bad, bad, good, bad, good] to play [good, good] instead of
-        aborting after 3 total failures across the entire queue.
+        The py-tgcalls update carries no track/stream identity (the handlers
+        use only ``update.chat_id``), so a delayed event from an older stream
+        cannot be matched to its track.  Instead a "stream_ended" event that
+        arrives within STALE_END_WINDOW_SEC of the current stream being
+        installed is ignored as stale (see ``_end_is_stale``).
 
         Stage log: [CONTROLLER] [ADVANCE]
         """
-        if chat_id not in self._advance_locks:
-            self._advance_locks[chat_id] = asyncio.Lock()
+        await self._advance(chat_id, reason=reason)
 
-        async with self._advance_locks[chat_id]:
-            logger.info("[CONTROLLER] [ADVANCE] Advancing  chat_id={}", chat_id)
+    async def skip(self, chat_id: int) -> SkipResult:
+        """
+        Manual /skip: advance exactly one track through the shared mechanism.
+
+        Outcomes are described by SkipOutcome; a skip that raced with another
+        advancement is reported as DUPLICATE and does NOT skip a second track.
+        """
+        if self._state.is_idle(chat_id):
+            return SkipResult(SkipOutcome.NOTHING_PLAYING)
+        return await self._advance(chat_id, reason="skip")
+
+    async def stop(self, chat_id: int) -> bool:
+        """
+        Stop playback: invalidate the session, cancel any in-flight stream
+        resolution, clear the upcoming queue and leave the voice chat.
+
+        Returns True when there was something to stop, False when the chat
+        was already idle.  The generation is bumped BEFORE waiting for the
+        transition lock, so an in-flight start/advance can never install a
+        stream after this call; it is cancelled (resolution) or discarded.
+        """
+        had_session = (
+            not self._state.is_idle(chat_id)
+            or self._voice.is_active(chat_id)
+            or not await self._session.is_empty(chat_id)
+        )
+        self._bump_generation(chat_id)
+        task = self._inflight.get(chat_id)
+        if task is not None and not task.done():
+            task.cancel()          # kills the yt-dlp process group (resolver)
+        async with self._transition_lock(chat_id):
+            # By now any in-flight operation has finished or been discarded.
+            await self._teardown(chat_id, reason="stop")
+        logger.info("[CONTROLLER] [STOP] Stopped  chat_id={}  had_session={}",
+                    chat_id, had_session)
+        return had_session
+
+    async def snapshot(self, chat_id: int) -> PlaybackSnapshot:
+        """Read-only view for /queue and /nowplaying (current track + upcoming)."""
+        upcoming = await self._session.get_upcoming(chat_id)
+        return PlaybackSnapshot(
+            current=self._state.current_track(chat_id),
+            upcoming=upcoming,
+            is_idle=self._state.is_idle(chat_id),
+            cap=self._max_q,
+        )
+
+    @property
+    def max_queue(self) -> int:
+        """Effective cap on upcoming tracks per chat (never above 10)."""
+        return self._max_q
+
+    def is_active(self, chat_id: int) -> bool:
+        """Return True when the bot is streaming in this chat."""
+        return self._voice.is_active(chat_id)
+
+    # ── Private pipeline ──────────────────────────────────────────────────────
+
+    async def _build_guarded(self, chat_id: int, gen: int, track: Track):
+        """
+        _build_stream() run as a cancellable task registered for the chat.
+
+        stop() cancels the task, which makes the resolver kill the yt-dlp
+        process group.  A cancellation caused by a generation change is
+        reported as _Superseded; any other cancellation propagates.
+        """
+        task = asyncio.ensure_future(self._build_stream(track))
+        self._inflight[chat_id] = task
+        try:
+            return await task
+        except asyncio.CancelledError:
+            if self.generation(chat_id) != gen:
+                raise _Superseded() from None
+            raise
+        finally:
+            if self._inflight.get(chat_id) is task:
+                del self._inflight[chat_id]
+
+    def _end_is_stale(self, chat_id: int) -> bool:
+        """
+        True when a natural "stream ended" event cannot belong to the current
+        stream because the current stream was installed moments ago.
+
+        Heuristic, not identity: it catches an old stream's end event that is
+        delivered just after a new stream was installed.  It cannot catch one
+        delivered later, and it also ignores a genuine end of a stream that
+        dies within the window (the user can /skip to recover).
+        """
+        started = self._started_at.get(chat_id)
+        track = self._state.current_track(chat_id)
+        if started is None or track is None:
+            return False
+        window = STALE_END_WINDOW_SEC
+        if track.duration > 0:
+            window = min(window, track.duration / 2)
+        return (self._clock() - started) < window
+
+    async def _advance(
+        self, chat_id: int, reason: str, gen: Optional[int] = None,
+    ) -> SkipResult:
+        """
+        THE single advancement path (natural end and /skip).
+
+        Duplicate suppression: the advance epoch is read BEFORE waiting for
+        the transition lock.  If another advancement completed while this
+        call was waiting, this call is a duplicate and does nothing — a
+        natural end racing with /skip, or two simultaneous /skip presses,
+        advance exactly one track.  A call that arrives after the other
+        advancement finished sees the new epoch and is a real request.
+
+        Stale protection: the session generation is re-checked after every
+        await that could install a stream; /stop bumps it.
+        """
+        entry_epoch = self._epochs.get(chat_id, 0)
+        if gen is None:
+            gen = self.generation(chat_id)
+        new_track: Optional[Track] = None
+        outcome = SkipOutcome.SKIPPED
+
+        async with self._transition_lock(chat_id):
+            if self.generation(chat_id) != gen:
+                return SkipResult(SkipOutcome.CANCELLED)
+            if self._epochs.get(chat_id, 0) != entry_epoch:
+                logger.info(
+                    "[CONTROLLER] [ADVANCE] Duplicate {} ignored  chat_id={}",
+                    reason, chat_id,
+                )
+                return SkipResult(SkipOutcome.DUPLICATE)
+            if self._state.is_idle(chat_id):
+                return SkipResult(SkipOutcome.NOTHING_PLAYING)
+            if reason == "stream_ended" and self._end_is_stale(chat_id):
+                logger.warning(
+                    "[CONTROLLER] [ADVANCE] Stale stream-end ignored "
+                    "(new stream installed moments ago)  chat_id={}",
+                    chat_id,
+                )
+                return SkipResult(SkipOutcome.STALE)
+
+            logger.info(
+                "[CONTROLLER] [ADVANCE] Advancing  chat_id={}  reason={}",
+                chat_id, reason,
+            )
             consecutive_failures = 0
+            outcome = SkipOutcome.FAILED
 
             while consecutive_failures < MAX_SKIP_RETRIES:
                 # ── Queue empty: all tracks played ─────────────────────────
@@ -334,8 +573,9 @@ class PlaybackController:
                         "leaving VC  chat_id={}",
                         chat_id,
                     )
-                    await self._cleanup.cleanup(chat_id, reason="queue_exhausted")
-                    return
+                    await self._teardown(chat_id, reason="queue_exhausted")
+                    outcome = SkipOutcome.QUEUE_ENDED
+                    break
 
                 # ── Dequeue next track ─────────────────────────────────────
                 next_track = await self._session.dequeue(chat_id)
@@ -345,8 +585,9 @@ class PlaybackController:
                         "despite non-empty queue  chat_id={}",
                         chat_id,
                     )
-                    await self._cleanup.cleanup(chat_id, reason="dequeue_returned_none")
-                    return
+                    await self._teardown(chat_id, reason="dequeue_returned_none")
+                    outcome = SkipOutcome.QUEUE_ENDED
+                    break
 
                 # ── Resolve and switch stream ──────────────────────────────
                 logger.info(
@@ -354,7 +595,9 @@ class PlaybackController:
                     next_track.title, chat_id,
                 )
                 try:
-                    stream = await self._build_stream(next_track)
+                    stream = await self._build_guarded(chat_id, gen, next_track)
+                except _Superseded:
+                    return SkipResult(SkipOutcome.CANCELLED)
                 except StreamResolveTimeoutError:
                     logger.error(
                         "[CONTROLLER] [ADVANCE] Resolver timeout for '{}' — "
@@ -372,19 +615,30 @@ class PlaybackController:
                     consecutive_failures += 1
                     continue
 
+                # Stopped while the build finished: never install a stale stream.
+                if self.generation(chat_id) != gen:
+                    return SkipResult(SkipOutcome.CANCELLED)
+
                 changed = await self._voice.replace_stream(chat_id, stream)
 
+                if self.generation(chat_id) != gen:
+                    # /stop arrived while the stream was being replaced.  It is
+                    # waiting for this lock and will leave the voice chat next;
+                    # touch neither state nor queue.
+                    return SkipResult(SkipOutcome.CANCELLED)
+
                 if changed:
-                    # ── Success: reset failure counter ─────────────────────
-                    consecutive_failures = 0
                     self._state.update_current_track(chat_id, next_track)
+                    self._started_at[chat_id] = self._clock()
+                    self._epochs[chat_id] = self._epochs.get(chat_id, 0) + 1
                     logger.info(
                         "[CONTROLLER] [ADVANCE] Playback advanced to '{}'  "
                         "chat_id={}",
                         next_track.title, chat_id,
                     )
-                    await self._send_now_playing(chat_id, next_track)
-                    return
+                    new_track = next_track
+                    outcome = SkipOutcome.SKIPPED
+                    break
 
                 # ── replace_stream failed — retry with next track ──────────
                 consecutive_failures += 1
@@ -393,93 +647,155 @@ class PlaybackController:
                     "(consecutive_failures={})  chat_id={}",
                     next_track.title, consecutive_failures, chat_id,
                 )
+            else:
+                # ── Consecutive failures exhausted ─────────────────────────
+                logger.error(
+                    "[CONTROLLER] [ADVANCE] {} consecutive failures — "
+                    "triggering cleanup  chat_id={}",
+                    consecutive_failures, chat_id,
+                )
+                await self._teardown(chat_id, reason="advance_retries_exhausted")
+                outcome = SkipOutcome.FAILED
 
-            # ── Consecutive failures exhausted ─────────────────────────────
-            logger.error(
-                "[CONTROLLER] [ADVANCE] {} consecutive failures — "
-                "triggering cleanup  chat_id={}",
-                consecutive_failures, chat_id,
-            )
-            await self._cleanup.cleanup(
-                chat_id, reason="advance_retries_exhausted"
-            )
+            if outcome != SkipOutcome.SKIPPED:
+                # Teardown ends the session; count it as a completed advance so
+                # a duplicate request waiting behind us is dropped.
+                self._epochs[chat_id] = self._epochs.get(chat_id, 0) + 1
 
-    def is_active(self, chat_id: int) -> bool:
-        """Return True when the bot is streaming in this chat."""
-        return self._voice.is_active(chat_id)
+        # Telegram I/O happens OUTSIDE the transition lock.
+        if new_track is not None and self.generation(chat_id) == gen:
+            await self._send_now_playing(chat_id, new_track)
+        return SkipResult(outcome, new_track)
 
-    # ── Private pipeline ──────────────────────────────────────────────────────
-
-    async def _start_now(self, chat_id: int) -> None:
+    async def _start_now(self, chat_id: int, gen: int, track: Track) -> bool:
         """
-        Dequeue the head track, resolve its stream, and join the voice chat.
+        Resolve *track*'s stream and join the voice chat (idle-start path).
 
-        Called by play() AFTER the play lock has been released — this method
-        performs slow I/O (stream resolution, VC join) and must NOT be called
-        while the play lock is held, or it would block concurrent /play calls
-        in the same chat for the entire duration of yt-dlp + VC join.
+        Called by play() AFTER the play lock has been released.  Runs under the
+        per-chat transition lock so /stop, /skip and natural-end events cannot
+        interleave with the stream installation.
 
-        On resolver timeout:  runs cleanup() and re-raises StreamResolveTimeoutError.
-        On resolver failure:  runs cleanup() and re-raises StreamResolveError.
-        On VC join failure:   runs cleanup() and raises VoiceChatError.
+        Returns True when playback started, False when the session was
+        superseded by /stop (nothing installed, state untouched — it belongs
+        to whoever stopped/restarted the chat).
 
-        State remains IDLE in all failure cases. The next /play starts clean.
+        Failure handling (tracks other users queued meanwhile are never
+        dropped silently):
+          * Resolver timeout / failure — a problem with THIS track only.  If
+            tracks are queued behind it, the next one is started through the
+            normal advancement path; the error is still raised so the
+            requester learns their track failed.  With nothing queued the
+            session is torn down.
+          * Voice join failure / private group — the voice chat itself is
+            unusable, so queued tracks cannot play either.  The session is torn
+            down and the chat is TOLD how many queued tracks were dropped.
 
         Stage log: [RESOLVE] [FFMPEG] [JOIN VC] [PLAY]
         """
-        track = await self._session.dequeue(chat_id)
-        if track is None:
-            return
+        pending_error: Optional[Exception] = None
+        dropped_notice: Optional[str] = None
+        try:
+            async with self._transition_lock(chat_id):
+                if self.generation(chat_id) != gen:
+                    return False
 
-        # ── Stage: RESOLVE ────────────────────────────────────────────────
+                # ── Stage: RESOLVE ────────────────────────────────────────
+                logger.info(
+                    "[CONTROLLER] [RESOLVE] Resolving stream  title='{}'",
+                    track.title,
+                )
+                try:
+                    stream = await self._build_guarded(chat_id, gen, track)
+                except _Superseded:
+                    return False
+                except (StreamResolveTimeoutError, StreamResolveError) as exc:
+                    logger.error(
+                        "[CONTROLLER] Track unplayable ({})  title='{}'  "
+                        "chat_id={}",
+                        type(exc).__name__, track.title, chat_id,
+                    )
+                    if await self._session.is_empty(chat_id):
+                        await self._teardown(chat_id, reason="resolver_failed")
+                        raise
+                    pending_error = exc     # advance to the queued tracks below
+                else:
+                    if self.generation(chat_id) != gen:
+                        return False
+
+                    # ── Stage: JOIN VC ────────────────────────────────────
+                    logger.info(
+                        "[CONTROLLER] [JOIN VC] Joining voice chat  chat_id={}",
+                        chat_id,
+                    )
+                    try:
+                        joined = await self._voice.play(chat_id, stream)
+                    except PrivateGroupError:
+                        dropped_notice = await self._voice_failure_teardown(
+                            chat_id, "private_group")
+                        raise
+
+                    if self.generation(chat_id) != gen:
+                        # /stop arrived during the join; it is waiting for this
+                        # lock and will leave the voice chat right after we
+                        # return.
+                        return False
+
+                    if not joined:
+                        dropped_notice = await self._voice_failure_teardown(
+                            chat_id, "vc_join_failed")
+                        raise VoiceChatError(
+                            "Could not join the voice chat. "
+                            "Make sure a voice chat is active and the "
+                            "assistant has permission to join."
+                        )
+
+                    # ── Stage: PLAY ───────────────────────────────────────
+                    self._state.transition_to_playing(chat_id, track)
+                    self._started_at[chat_id] = self._clock()
+                    logger.info(
+                        "[CONTROLLER] [PLAY] Playback started  title='{}'  "
+                        "chat_id={}",
+                        track.title, chat_id,
+                    )
+                    return True
+        finally:
+            # Telegram I/O happens after the transition lock is released.
+            if dropped_notice is not None and self._notify is not None:
+                try:
+                    await self._notify(chat_id, dropped_notice)
+                except Exception as exc:
+                    logger.debug("[CONTROLLER] drop notice failed: {}", exc)
+
+        # Resolver failure with tracks queued behind: start the next one.
+        # The captured generation makes this a no-op if /stop (or a newer
+        # session) intervened since the lock was released.
+        if pending_error is None:       # defensive: every other path returned/raised
+            return False
         logger.info(
-            "[CONTROLLER] [RESOLVE] Resolving stream  title='{}'",
-            track.title,
+            "[CONTROLLER] First track failed — advancing to queued tracks  "
+            "chat_id={}", chat_id,
         )
         try:
-            stream = await self._build_stream(track)
-        except StreamResolveTimeoutError:
+            await self._advance(chat_id, reason="start_failed", gen=gen)
+        except Exception as exc:
+            # The requester must still learn why THEIR track failed.
             logger.error(
-                "[CONTROLLER] Resolver timeout — track unplayable  "
-                "title='{}'  chat_id={}",
-                track.title, chat_id,
+                "[CONTROLLER] Advance after failed start raised  chat_id={}  "
+                "error={}", chat_id, exc,
             )
-            await self._cleanup.cleanup(chat_id, reason="resolver_timeout")
-            raise
-        except StreamResolveError:
-            logger.error(
-                "[CONTROLLER] Stream unavailable — track unplayable  "
-                "title='{}'  chat_id={}",
-                track.title, chat_id,
+        raise pending_error
+
+    async def _voice_failure_teardown(self, chat_id: int, reason: str) -> Optional[str]:
+        """Tear down after a voice failure; return a notice if tracks were dropped."""
+        dropped = len(await self._session.get_upcoming(chat_id))
+        await self._teardown(chat_id, reason=reason)
+        if dropped:
+            return (
+                f"⚠️ The voice chat could not be joined, so {dropped} queued "
+                f"track{'s' if dropped != 1 else ''} could not be played and "
+                "the queue was cleared."
             )
-            await self._cleanup.cleanup(chat_id, reason="resolver_failed")
-            raise
-
-        # ── Stage: JOIN VC ────────────────────────────────────────────────
-        logger.info(
-            "[CONTROLLER] [JOIN VC] Joining voice chat  chat_id={}",
-            chat_id,
-        )
-        try:
-            joined = await self._voice.play(chat_id, stream)
-        except PrivateGroupError:
-            await self._cleanup.cleanup(chat_id, reason="private_group")
-            raise
-
-        if not joined:
-            await self._cleanup.cleanup(chat_id, reason="vc_join_failed")
-            raise VoiceChatError(
-                "Could not join the voice chat. "
-                "Make sure a voice chat is active and the assistant has "
-                "permission to join."
-            )
-
-        # ── Stage: PLAY ───────────────────────────────────────────────────
-        self._state.transition_to_playing(chat_id, track)
-        logger.info(
-            "[CONTROLLER] [PLAY] Playback started  title='{}'  chat_id={}",
-            track.title, chat_id,
-        )
+        return None
 
     async def _build_stream(self, track: Track):
         """
